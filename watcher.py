@@ -15,6 +15,9 @@ Usage:
   watcher.py                   run forever
   watcher.py --once            one pass over every feed (writes state/queue, may escalate)
   watcher.py --once --dry-run  one pass, prints hits, writes/escalates nothing
+
+Latency pass 2026-10-26 ~14:40 EAT: 5 s tick, parallel fetch (16 workers), 30-60 s polls on wires/official feeds,
+urgent hits dispatched alone at once (30 s floor), batches every 3 min, cap 60/day (last 10 reserved for urgent).
 """
 from __future__ import annotations
 
@@ -35,6 +38,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from zoneinfo import ZoneInfo
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -45,11 +49,14 @@ QUEUE_PATH = os.environ.get("HERALD_QUEUE_PATH") or os.path.join(HERALD, "breaki
 WEBHOOK_ENV = os.environ.get("HERALD_WEBHOOK_ENV") or os.path.join(HERE, "webhook.env")
 INSTANCE = os.environ.get("HERALD_INSTANCE", "box")   # "box" or e.g. "gha" (always-on copy)
 TZ = ZoneInfo("Africa/Kampala")
-TICK_SECONDS = 15                   # main loop tick; each feed has its own interval below
+TICK_SECONDS = 5                    # main loop tick (latency pass 2026-10-26: was 15); each feed has its own interval
+MIN_FEED_INTERVAL_S = 30            # politeness floor: no feed is fetched more often than every 30 s
+FETCH_WORKERS = 16                  # feeds due in a tick are fetched in parallel (was serial: 30-130 s cycles)
+HOST_BACKOFF_S = (300, 900, 1800)   # 401/403/429/503 from a host: back off that host 5 -> 15 -> 30 min
 MAX_AGE_MIN = 45                    # breaking: drop items published more than 45 min ago
 FIRST_RUN_MAX_AGE_MIN = 45
 UA = "Mozilla/5.0 (X11; Linux x86_64) HeraldWatcher/2.0 (+news monitor for @JhMpologoma)"
-TIMEOUT = 15
+TIMEOUT = 12
 
 # ---- topic switches (2026-10-25 ~20:00 EAT: everything on again; env can still turn parts off)
 CRYPTO_ENABLED = os.environ.get("HERALD_CRYPTO", "1") == "1"
@@ -57,8 +64,9 @@ PRICE_ALERTS_ENABLED = os.environ.get("HERALD_PRICES", "1") == "1"
 NEWS_ENABLED = os.environ.get("HERALD_NEWS", "1") == "1"
 
 # ---- webhook limits (breaking-news level)
-ESC_MIN_GAP_S = 8 * 60              # at most one webhook every 8 minutes
-ESC_MAX_PER_DAY = 40                # per EAT day
+ESC_MIN_GAP_S = 3 * 60              # normal batches: at most one webhook every 3 min (latency pass: was 8)
+ESC_MAX_PER_DAY = 60                # per EAT day (latency pass: was 40)
+ESC_RESERVE_FOR_URGENT = 10         # the last 10 of the daily cap are kept for urgent (fast-lane) hits only
 MAX_HITS_PER_WEBHOOK = 6            # several hits batched per webhook, best first
 AI_MAX_HITS_PER_POST = 3            # AI can't crowd out the rest of a batch
 AI_HIT_THRESHOLD = 9
@@ -69,12 +77,17 @@ STORY_DEDUPE_S = 3 * 3600           # same entity+event+number story: one hit pe
 # ---- fast lane (2026-10-26): top wires/official sources with score >= FAST_LANE_MIN_SCORE skip the
 # 8-minute gap (daily cap still applies) and are flagged priority:true in the webhook payload.
 FAST_LANE_MIN_SCORE = 10
-FAST_LANE_MIN_GAP_S = 60            # anti-burst floor between two fast-lane webhooks
-FAST_LANE_DOMAINS = re.compile(r"(^|\.)(reuters\.com|apnews\.com|bloomberg\.com|bbc\.co\.uk|bbc\.com|nikkei\.com|"
+FAST_LANE_MIN_GAP_S = 30            # anti-burst floor between two fast-lane webhooks (latency pass: was 60)
+URGENT_ANY_SOURCE_MIN_SCORE = 13    # non-wire items this strong are also sent at once, on their own
+URGENT_MAX_PER_WEBHOOK = 2          # urgent hits go out alone (or in a pair), never wait for a batch
+FAST_LANE_DOMAINS = re.compile(r"(^|\.)(reuters\.com|apnews\.com|bloomberg\.com|bbc\.co\.uk|bbc\.com|nikkei\.com|cnbc\.com|wsj\.com|"
+                               r"ecb\.europa\.eu|bankofengland\.co\.uk|boj\.or\.jp|bankofcanada\.ca|"
                                r"federalreserve\.gov|sec\.gov|whitehouse\.gov|treasury\.gov|bls\.gov|[a-z0-9-]+\.gov)$", re.I)
 FAST_LANE_PUBLISHERS = re.compile(r"^(reuters|associated press|ap news|bloomberg|bbc|bbc news|nikkei asia|nikkei|"
+                                  r"cnbc|the wall street journal|wsj|financial times|"
                                   r"the white house|federal reserve|u\.s\. department of the treasury|bureau of labor statistics)\b", re.I)
-FAST_LANE_FEEDS = re.compile(r"^(Reuters|BBC|Nikkei|Federal Reserve|SEC press|White House|GN: (Reuters|AP|Bloomberg|treasury\.gov|bls\.gov))", re.I)
+FAST_LANE_FEEDS = re.compile(r"^(Reuters|BBC|Nikkei|CNBC|WSJ|MarketWatch Bulletins|Federal Reserve|SEC press|White House|ECB|Bank of (England|Japan|Canada)|BEA|"
+                             r"GN: (Reuters|AP|Bloomberg|treasury\.gov|bls\.gov))", re.I)
 AI_STORY_DEDUPE_S = 12 * 3600
 
 def gnews(q: str) -> str:
@@ -83,63 +96,80 @@ def gnews(q: str) -> str:
 # name, url, tier (official | reputable | aggregator), poll interval (s)
 # All checked with curl on 2026-10-25 ~19:50 EAT (HTTP 200, parseable, fresh items).
 NEWS_FEEDS = [
+    # Latency pass 2026-10-26 ~14:40 EAT: fastest feeds polled every 30-60 s (floor 30 s), conditional GET where supported.
     # wires / markets (fast)
-    ("CNBC Top News", "https://www.cnbc.com/id/100003114/device/rss/rss.html", "reputable", 60),
-    ("CNBC World", "https://www.cnbc.com/id/100727362/device/rss/rss.html", "reputable", 75),
-    ("CNBC Markets", "https://www.cnbc.com/id/15839069/device/rss/rss.html", "reputable", 75),
-    ("CNBC Economy", "https://www.cnbc.com/id/20910258/device/rss/rss.html", "reputable", 90),
+    ("CNBC Top News", "https://www.cnbc.com/id/100003114/device/rss/rss.html", "reputable", 30),
+    ("CNBC World", "https://www.cnbc.com/id/100727362/device/rss/rss.html", "reputable", 45),
+    ("CNBC Markets", "https://www.cnbc.com/id/15839069/device/rss/rss.html", "reputable", 45),
+    ("CNBC Economy", "https://www.cnbc.com/id/20910258/device/rss/rss.html", "reputable", 60),
     ("CNBC Investing", "https://www.cnbc.com/id/15839135/device/rss/rss.html", "reputable", 90),
-    ("MarketWatch Bulletins", "https://feeds.content.dowjones.io/public/rss/mw_bulletins", "reputable", 75),
-    ("MarketWatch Top", "https://feeds.content.dowjones.io/public/rss/mw_topstories", "reputable", 90),
-    ("MarketWatch Pulse", "https://feeds.content.dowjones.io/public/rss/mw_marketpulse", "reputable", 90),
-    ("WSJ Markets", "https://feeds.content.dowjones.io/public/rss/RSSMarketsMain", "reputable", 90),
-    ("WSJ World", "https://feeds.content.dowjones.io/public/rss/RSSWorldNews", "reputable", 90),
-    ("Yahoo Finance", "https://feeds.finance.yahoo.com/rss/2.0/headline?s=%5EGSPC,%5EIXIC,BTC-USD,NVDA,TSLA&region=US&lang=en-US", "reputable", 120),
-    ("BBC World", "https://feeds.bbci.co.uk/news/world/rss.xml", "reputable", 120),
-    ("BBC Business", "https://feeds.bbci.co.uk/news/business/rss.xml", "reputable", 180),
-    ("Al Jazeera", "https://www.aljazeera.com/xml/rss/all.xml", "reputable", 120),
-    ("Guardian Business", "https://www.theguardian.com/business/rss", "reputable", 180),
-    ("NYT World", "https://rss.nytimes.com/services/xml/rss/nyt/World.xml", "reputable", 180),
-    ("NYT Business", "https://rss.nytimes.com/services/xml/rss/nyt/Business.xml", "reputable", 180),
+    ("MarketWatch Bulletins", "https://feeds.content.dowjones.io/public/rss/mw_bulletins", "reputable", 30),
+    ("MarketWatch Top", "https://feeds.content.dowjones.io/public/rss/mw_topstories", "reputable", 60),
+    ("MarketWatch Pulse", "https://feeds.content.dowjones.io/public/rss/mw_marketpulse", "reputable", 60),
+    ("WSJ Markets", "https://feeds.content.dowjones.io/public/rss/RSSMarketsMain", "reputable", 45),
+    ("WSJ World", "https://feeds.content.dowjones.io/public/rss/RSSWorldNews", "reputable", 45),
+    ("Yahoo Finance", "https://feeds.finance.yahoo.com/rss/2.0/headline?s=%5EGSPC,%5EIXIC,BTC-USD,NVDA,TSLA&region=US&lang=en-US", "reputable", 90),
+    ("BBC World", "https://feeds.bbci.co.uk/news/world/rss.xml", "reputable", 45),
+    ("BBC Business", "https://feeds.bbci.co.uk/news/business/rss.xml", "reputable", 60),
+    ("Al Jazeera", "https://www.aljazeera.com/xml/rss/all.xml", "reputable", 90),
+    ("Guardian Business", "https://www.theguardian.com/business/rss", "reputable", 120),
+    ("NYT World", "https://rss.nytimes.com/services/xml/rss/nyt/World.xml", "reputable", 90),
+    ("NYT Business", "https://rss.nytimes.com/services/xml/rss/nyt/Business.xml", "reputable", 120),
     # official
-    ("Federal Reserve", "https://www.federalreserve.gov/feeds/press_all.xml", "official", 60),
-    ("SEC press releases", "https://www.sec.gov/news/pressreleases.rss", "official", 90),
-    ("White House", "https://www.whitehouse.gov/news/feed/", "official", 90),
+    # press_all.xml is the right URL (200 + ETag); its CDN returns a stray 404 now and then -> fetch retries once.
+    ("Federal Reserve", "https://www.federalreserve.gov/feeds/press_all.xml", "official", 30),
+    ("Federal Reserve monetary", "https://www.federalreserve.gov/feeds/press_monetary.xml", "official", 30),
+    ("SEC press releases", "https://www.sec.gov/news/pressreleases.rss", "official", 45),
+    ("White House", "https://www.whitehouse.gov/news/feed/", "official", 45),
+    ("White House actions", "https://www.whitehouse.gov/presidential-actions/feed/", "official", 45),
+    ("ECB press", "https://www.ecb.europa.eu/rss/press.html", "official", 45),
+    ("Bank of England news", "https://www.bankofengland.co.uk/rss/news", "official", 60),
+    ("Bank of Japan", "https://www.boj.or.jp/en/rss/whatsnew.xml", "official", 90),
+    ("Bank of Canada press", "https://www.bankofcanada.ca/content_type/press-releases/feed/", "official", 45),
+    ("BEA releases", "https://apps.bea.gov/rss/rss.xml", "official", 60),
     # treasury.gov has no working RSS (404) and bls.gov returns 403 to scripts: Google News site: fallbacks
-    ("GN: treasury.gov", gnews("site:home.treasury.gov when:1d"), "official", 240),
-    ("GN: bls.gov", gnews("site:bls.gov when:1d"), "official", 240),
+    ("GN: treasury.gov", gnews("site:home.treasury.gov when:1d"), "official", 120),
+    ("GN: bls.gov", gnews("site:bls.gov when:1d"), "official", 120),
     # Google News top-story searches (aggregator tier; publisher shown in item)
-    ("GN: Trump", gnews("Trump (announces OR signs OR tariff OR \"executive order\" OR says) when:1h"), "aggregator", 150),
-    ("GN: Fed/rates", gnews("(\"Federal Reserve\" OR Powell OR \"rate cut\" OR \"rate hike\" OR FOMC) when:1h"), "aggregator", 150),
-    ("GN: tariffs/trade", gnews("(tariff OR tariffs OR sanctions OR \"trade deal\") when:1h"), "aggregator", 180),
-    ("GN: US data", gnews("(CPI OR inflation OR \"jobs report\" OR payrolls OR GDP OR PPI OR unemployment) report when:1h"), "aggregator", 180),
-    ("GN: Nvidia/Tesla/Musk", gnews("(Nvidia OR Tesla OR SpaceX OR \"Elon Musk\") when:1h"), "aggregator", 180),
-    ("GN: Big Tech", gnews("(Apple OR Microsoft OR Amazon OR Alphabet OR Meta) (earnings OR revenue OR announces OR lawsuit OR fined OR acquire) when:1h"), "aggregator", 240),
-    ("GN: Wall St banks", gnews("(JPMorgan OR BlackRock OR Goldman OR \"Bank of America\" OR \"Wells Fargo\" OR Citi) when:1h"), "aggregator", 240),
-    ("GN: markets moves", gnews("(\"stock market\" OR \"S&P 500\" OR Nasdaq OR Dow OR gold OR oil) (record OR plunges OR surges OR crash OR wiped OR soars) when:1h"), "aggregator", 180),
-    ("GN: world breaking", gnews("(war OR missile OR ceasefire OR attack OR earthquake OR emergency OR coup) (Russia OR Ukraine OR China OR Taiwan OR Israel OR Iran OR NATO OR \"North Korea\") when:1h"), "aggregator", 180),
-    ("GN: Reuters", gnews("site:reuters.com when:1h"), "reputable", 180),
-    ("GN: AP", gnews("site:apnews.com when:1h"), "reputable", 240),
-    ("GN: Bloomberg", gnews("site:bloomberg.com when:1h"), "reputable", 180),
+    ("GN: Trump", gnews("Trump (announces OR signs OR tariff OR \"executive order\" OR says) when:1h"), "aggregator", 90),
+    ("GN: Fed/rates", gnews("(\"Federal Reserve\" OR Powell OR \"rate cut\" OR \"rate hike\" OR FOMC) when:1h"), "aggregator", 90),
+    ("GN: central banks", gnews('("rate decision" OR "cuts rates" OR "raises rates" OR "holds rates" OR "leaves rates" OR "keeps rates") (ECB OR "Bank of England" OR "Bank of Japan" OR "Bank of Canada" OR Fed OR RBA OR SNB OR PBOC) when:1h'), "aggregator", 90),
+    ("GN: tariffs/trade", gnews("(tariff OR tariffs OR sanctions OR \"trade deal\") when:1h"), "aggregator", 120),
+    ("GN: US data", gnews("(CPI OR inflation OR \"jobs report\" OR payrolls OR GDP OR PPI OR unemployment) report when:1h"), "aggregator", 120),
+    ("GN: Nvidia/Tesla/Musk", gnews("(Nvidia OR Tesla OR SpaceX OR \"Elon Musk\") when:1h"), "aggregator", 120),
+    ("GN: Big Tech", gnews("(Apple OR Microsoft OR Amazon OR Alphabet OR Meta) (earnings OR revenue OR announces OR lawsuit OR fined OR acquire) when:1h"), "aggregator", 150),
+    ("GN: megacap deals", gnews('(Meta OR Apple OR Microsoft OR Nvidia OR Amazon OR Alphabet OR Tesla OR Berkshire OR OpenAI OR Broadcom OR Oracle) ("stock sale" OR offering OR acquire OR acquisition OR buyback OR "billion deal" OR merger) when:1h'), "aggregator", 90),
+    ("GN: Wall St banks", gnews("(JPMorgan OR BlackRock OR Goldman OR \"Bank of America\" OR \"Wells Fargo\" OR Citi) when:1h"), "aggregator", 180),
+    ("GN: markets moves", gnews("(\"stock market\" OR \"S&P 500\" OR Nasdaq OR Dow OR gold OR oil) (record OR plunges OR surges OR crash OR wiped OR soars) when:1h"), "aggregator", 120),
+    ("GN: world breaking", gnews("(war OR missile OR ceasefire OR attack OR earthquake OR emergency OR coup) (Russia OR Ukraine OR China OR Taiwan OR Israel OR Iran OR NATO OR \"North Korea\") when:1h"), "aggregator", 120),
+    # Reuters' direct sitemap is behind a DataDome bot wall (HTTP 401 since 12:47 EAT, browser UA too) -> removed;
+    # Reuters/AP/Bloomberg now come through four Google News site: queries polled every 60 s.
+    ("GN: Reuters", gnews("site:reuters.com when:1h"), "reputable", 60),
+    ("GN: Reuters world", gnews("site:reuters.com/world when:1h"), "reputable", 60),
+    ("GN: Reuters business", gnews("site:reuters.com/business when:1h"), "reputable", 60),
+    ("GN: Reuters markets", gnews("site:reuters.com/markets when:1h"), "reputable", 60),
+    ("GN: AP", gnews("site:apnews.com when:1h"), "reputable", 60),
+    ("GN: Bloomberg", gnews("site:bloomberg.com when:1h"), "reputable", 60),
     # ---- speed fixes 2026-10-26: direct wires + world/politics (all curl-checked 2026-10-26 ~09:00 EAT)
-    # Reuters has no public RSS; its Google-News sitemap is direct, updated within a minute, ETag-aware.
-    ("Reuters (sitemap)", "https://www.reuters.com/arc/outboundfeeds/news-sitemap/?outputType=xml", "reputable", 60),
-    ("GN: Reuters world", gnews("site:reuters.com/world when:1h"), "reputable", 150),
-    ("BBC Top Stories", "https://feeds.bbci.co.uk/news/rss.xml", "reputable", 75),
-    ("BBC Africa", "https://feeds.bbci.co.uk/news/world/africa/rss.xml", "reputable", 240),
-    ("Nikkei Asia", "https://asia.nikkei.com/rss/feed/nar", "reputable", 120),       # undated items: first-seen time used
-    ("Japan Times", "https://www.japantimes.co.jp/feed/", "reputable", 240),
-    ("Guardian World", "https://www.theguardian.com/world/rss", "reputable", 150),
-    ("DW", "https://rss.dw.com/rdf/rss-en-all", "reputable", 180),
-    ("France 24", "https://www.france24.com/en/rss", "reputable", 180),
-    ("Sky News World", "https://feeds.skynews.com/feeds/rss/world.xml", "reputable", 180),
+    ("BBC Top Stories", "https://feeds.bbci.co.uk/news/rss.xml", "reputable", 30),
+    ("BBC Africa", "https://feeds.bbci.co.uk/news/world/africa/rss.xml", "reputable", 180),
+    ("Nikkei Asia", "https://asia.nikkei.com/rss/feed/nar", "reputable", 90),       # undated items: first-seen time used
+    ("Japan Times", "https://www.japantimes.co.jp/feed/", "reputable", 180),
+    ("Guardian World", "https://www.theguardian.com/world/rss", "reputable", 90),
+    ("DW", "https://rss.dw.com/rdf/rss-en-all", "reputable", 120),
+    ("France 24", "https://www.france24.com/en/rss", "reputable", 120),
+    ("Sky News World", "https://feeds.skynews.com/feeds/rss/world.xml", "reputable", 120),
     # apnews.com RSS returns 403 to scripts; NHK World English feed 404 / Japanese feed stale: Google News fallbacks
-    ("GN: NHK World", gnews("site:www3.nhk.or.jp/nhkworld when:1h"), "reputable", 240),
-    ("GN: election results", gnews('("election results" OR concedes OR "wins election" OR "wins presidency" OR "sworn in" OR runoff OR "re-elected" OR "wins re-election" OR landslide) when:1h'), "aggregator", 120),
-    ("GN: leaders", gnews('("prime minister" OR president OR king OR pope) (resigns OR "steps down" OR dies OR died OR impeached OR ousted OR assassinated OR arrested) when:1h'), "aggregator", 120),
-    ("GN: world breaking 2", gnews('(coup OR invasion OR assassination OR earthquake OR tsunami OR "state of emergency" OR "martial law" OR ceasefire) when:1h'), "aggregator", 120),
-    ("GN: Africa", gnews('(Uganda OR Kenya OR Nigeria OR "South Africa" OR Ethiopia OR Ghana OR Tanzania OR Rwanda) (president OR election OR protest OR central bank OR dies OR coup) when:2h'), "aggregator", 240),
+    ("GN: NHK World", gnews("site:www3.nhk.or.jp/nhkworld when:1h"), "reputable", 180),
+    ("GN: election results", gnews('("election results" OR concedes OR "wins election" OR "wins presidency" OR "sworn in" OR runoff OR "re-elected" OR "wins re-election" OR landslide) when:1h'), "aggregator", 90),
+    ("GN: leaders", gnews('("prime minister" OR president OR king OR pope) (resigns OR "steps down" OR dies OR died OR impeached OR ousted OR assassinated OR arrested) when:1h'), "aggregator", 90),
+    ("GN: world breaking 2", gnews('(coup OR invasion OR assassination OR earthquake OR tsunami OR "state of emergency" OR "martial law" OR ceasefire) when:1h'), "aggregator", 90),
+    ("GN: Africa", gnews('(Uganda OR Kenya OR Nigeria OR "South Africa" OR Ethiopia OR Ghana OR Tanzania OR Rwanda) (president OR election OR protest OR central bank OR dies OR coup) when:2h'), "aggregator", 180),
 ]
+# feeds added in the latency pass: their first fetch only marks items seen (no backlog burst)
+LATENCY_NEW_FEEDS = {"Federal Reserve monetary", "White House actions", "ECB press", "Bank of England news", "Bank of Japan",
+                     "Bank of Canada press", "BEA releases", "GN: central banks", "GN: megacap deals",
+                     "GN: Reuters business", "GN: Reuters markets"}
 
 CRYPTO_FEEDS = [
     ("CoinDesk", "https://www.coindesk.com/arc/outboundfeeds/rss/", "reputable", 90),
@@ -208,7 +238,7 @@ FJ_POLL_S = 75
 FJ_MIN_SCORE = 12
 FJ_FEEDS = [(FJ_NAME, FJ_URL, "aggregator", FJ_POLL_S)] if os.environ.get("HERALD_FJ", "1") == "1" else []
 FEEDS = FEEDS + FJ_FEEDS
-PRIME_ON_FIRST_FETCH = {FJ_NAME}        # new feed: first fetch only marks items seen (no backlog burst)
+PRIME_ON_FIRST_FETCH = {FJ_NAME} | LATENCY_NEW_FEEDS   # new feed: first fetch only marks items seen (no backlog burst)
 FJ_PREFIX = re.compile(r"^\s*financialjuice:\s*", re.I)
 # routine noise: always dropped
 FJ_NOISE = re.compile(
@@ -510,22 +540,61 @@ def parse_feed(data: bytes) -> list[dict]:
                 items.append(it)
     return items
 
-def fetch_feed(name: str, url: str, st: dict) -> list[dict]:
+class FeedHTTPError(RuntimeError):
+    def __init__(self, code: int):
+        super().__init__(f"HTTP {code}")
+        self.code = code
+
+
+def fetch_prepare(url: str, st: dict) -> dict:
+    """Conditional-GET headers (ETag / Last-Modified) for this URL. Main thread only."""
     cache = st.setdefault("http_cache", {}).setdefault(url, {})
     hdr = {}
     if cache.get("etag"):
         hdr["If-None-Match"] = cache["etag"]
     if cache.get("lm"):
         hdr["If-Modified-Since"] = cache["lm"]
-    code, body, headers = http_get(url, hdr)
+    return hdr
+
+
+def fetch_http(url: str, hdr: dict):
+    """Worker-thread HTTP fetch. Retries once after 1.5 s on a stray 404/5xx/timeout (federalreserve.gov's CDN
+    returns an occasional 404 for a URL that is fine on the next request). Returns (code, body, headers)."""
+    for attempt in (0, 1):
+        try:
+            code, body, headers = http_get(url, hdr)
+        except Exception:
+            if attempt:
+                raise
+            time.sleep(1.5)
+            continue
+        if attempt == 0 and (code == 404 or code in (500, 502, 503, 504)):
+            time.sleep(1.5)
+            continue
+        return code, body, headers
+
+
+def fetch_finish(url: str, st: dict, code: int, body: bytes, headers: dict) -> list[dict]:
+    cache = st.setdefault("http_cache", {}).setdefault(url, {})
     if code == 304:
         return []
     if code != 200:
-        raise RuntimeError(f"HTTP {code}")
+        raise FeedHTTPError(code)
     h = {k.lower(): v for k, v in headers.items()}
     cache["etag"] = h.get("etag")
     cache["lm"] = h.get("last-modified")
     return parse_feed(body)
+
+
+def fetch_feed(name: str, url: str, st: dict) -> list[dict]:
+    return fetch_finish(url, st, *fetch_http(url, fetch_prepare(url, st)))
+
+
+def host_of(url: str) -> str:
+    try:
+        return urllib.parse.urlsplit(url).netloc.lower()
+    except Exception:
+        return ""
 
 # ------------------------------------------------------------------ general (Watcher Guru style) scoring
 # Entity groups (title). Specific match text is used for the story key.
@@ -633,6 +702,7 @@ NEWS_BIG = re.compile(
 NEWS_FLUFF = re.compile(
     r"\bopinion\b|op-ed|\banalysis\b|\bcommentary\b|\bcolumn\b|\bexplainer\b|\bexplained\b|what to know|"
     r"what we know|\btakeaways?\b|\bkey moments\b|\bwhat happened\b|\bhow to\b|\bhow (the|a|an|this|it)\b|^why\b|\bwhy (the|a|an|this|you|it|investors|stocks)\b|"
+    r"^live news\b|^the (morning|evening|daily|weekly) \w+( \w+)? (report|brief|briefing|download|wrap)\b|"  # latency pass: live blogs/newsletters never urgent
     r"\bpodcast\b|\bnewsletter\b|^watch:|^video:|^live:|\blive updates?\b|\blive:|\bas it happened\b|week ahead|"
     r"\bmorning (brief|briefing|bid)\b|\bevening briefing\b|\bstocks? to (buy|watch)\b|\bbest stocks\b|"
     r"\bstocks making the biggest moves\b|\bthings to know\b|\b\d+ (things|ways|reasons|stocks)\b|\btop \d+\b|"
@@ -662,11 +732,32 @@ OFFICIAL_RELEVANT = {
     "White House": re.compile(r"executive order|proclamation|tariff|sanction|fact sheet|announces|signs|"
                               r"trade|deal|agreement|crypto|digital asset|ai\b|artificial intelligence|"
                               r"economy|tax|energy|oil|china|russia|ukraine|israel|iran", re.I),
+    "Federal Reserve monetary": re.compile(r"fomc|monetary policy|federal funds|discount rate|statement|minutes|emergency|facility", re.I),
+    "White House actions": re.compile(r"executive order|proclamation|tariff|sanction|duties|import|export|emergency|crypto|digital asset|"
+                                      r"artificial intelligence|china|russia|iran|canada|mexico|trade", re.I),
+    "ECB press": re.compile(r"monetary policy|interest rates?|decision|statement|press conference|lagarde|digital euro|emergency", re.I),
+    "Bank of England news": re.compile(r"bank rate|monetary policy|interest rate|financial stability|governor|bailey|stablecoin|emergency", re.I),
+    "Bank of Japan": re.compile(r"monetary policy|statement|policy rate|outlook for economic activity|ueda|governor|intervention", re.I),
+    "Bank of Canada press": re.compile(r"policy rate|interest rate|monetary policy|governor|macklem|emergency", re.I),
+    "BEA releases": re.compile(r"gross domestic product|\bgdp\b|personal income|outlays|\bpce\b|trade in goods", re.I),
     "GN: bls.gov": re.compile(r"consumer price index|producer price index|employment situation|"
                               r"jobs|payroll|unemployment|cpi|ppi|inflation", re.I),
     "GN: treasury.gov": re.compile(r"sanction|tariff|debt|refunding|buyback|stablecoin|genius|crypto|"
                                    r"secretary|bessent|ofac", re.I),
 }
+# Official headline releases: a matching title is lifted to at least this score (it often lacks our entity words,
+# e.g. ECB "Monetary policy decisions") so a rate decision or a GDP/PCE print is never gated out.
+OFFICIAL_MAJOR = {
+    "Federal Reserve": (re.compile(r"fomc statement|issues fomc|discount rate|emergency|federal funds|monetary policy (statement|action)", re.I), 13),
+    "Federal Reserve monetary": (re.compile(r"fomc statement|issues fomc|discount rate|emergency|federal funds|monetary policy (statement|action)", re.I), 13),
+    "ECB press": (re.compile(r"monetary policy decisions?|emergency", re.I), 13),
+    "Bank of England news": (re.compile(r"bank rate|monetary policy summary|emergency", re.I), 13),
+    "Bank of Japan": (re.compile(r"statement on monetary policy|monetary policy decision|change in (the )?(guideline|policy)", re.I), 13),
+    "Bank of Canada press": (re.compile(r"(maintains|holds|lowers|raises|cuts|increases|reduces) (its )?(target for the overnight rate|policy rate)", re.I), 13),
+    "BEA releases": (re.compile(r"gross domestic product|\bgdp\b|personal income and outlays", re.I), 12),
+    "White House actions": (re.compile(r"executive order|proclamation|tariff|sanction", re.I), 11),
+}
+
 TOPIC_ORDER = [("Crypto", "crypto"), ("Macro", "macro"), ("Markets", "markets"),
                ("Tech", "bigco"), ("World", "politics"), ("World", "crisis"), ("World", "world"), ("World", "people")]
 
@@ -1071,7 +1162,18 @@ def post_webhook(cfg: dict, payload: dict) -> bool:
         log.warning("webhook error: %s", e)
     return False
 
+def is_urgent(h: dict) -> bool:
+    """Sent at once, on its own: wire/official fast-lane hits (priority) and any very strong non-lead hit."""
+    sc = h.get("score", 0)
+    if h.get("priority") and sc >= FAST_LANE_MIN_SCORE:
+        return True
+    return sc >= URGENT_ANY_SOURCE_MIN_SCORE and not h.get("lead_only") and h.get("kind") != "price"
+
+
 def maybe_escalate(st: dict, dry: bool):
+    """Latency pass 2026-10-26: urgent hits go out immediately on their own (30 s anti-burst floor);
+    the rest are batched at most every ESC_MIN_GAP_S. The last ESC_RESERVE_FOR_URGENT of the daily cap
+    are kept for urgent hits."""
     pend = st.setdefault("pending_escalation", [])
     t = now_ts()
     # breaking only: drop anything published more than MAX_AGE_MIN ago (it's still in the queue file)
@@ -1092,22 +1194,29 @@ def maybe_escalate(st: dict, dry: bool):
         esc.update(day=day, count=0)
     if esc["count"] >= ESC_MAX_PER_DAY:
         return
+    reserve_only = esc["count"] >= ESC_MAX_PER_DAY - ESC_RESERVE_FOR_URGENT
     gap = t - esc.get("last", 0)
-    fast = [h for h in pend if h.get("priority") and h.get("score", 0) >= FAST_LANE_MIN_SCORE]
-    fast_lane = bool(fast) and gap < ESC_MIN_GAP_S
-    if gap < ESC_MIN_GAP_S and not (fast and gap >= FAST_LANE_MIN_GAP_S):
+    rank = lambda h: (not h.get("priority"), -h.get("score", 0), -h.get("published_ts", 0))
+    urgent = sorted([h for h in pend if is_urgent(h)], key=rank)
+    fast_lane = False
+    if urgent and gap >= FAST_LANE_MIN_GAP_S:
+        send, fast_lane = urgent[:URGENT_MAX_PER_WEBHOOK], True
+    elif gap >= ESC_MIN_GAP_S and not reserve_only:
+        # priority hits first, then by score
+        send, n_ai = [], 0
+        for h in sorted(pend, key=rank):
+            if h.get("topic") == "AI":
+                if n_ai >= AI_MAX_HITS_PER_POST:
+                    continue
+                n_ai += 1
+            send.append(h)
+            if len(send) >= MAX_HITS_PER_WEBHOOK:
+                break
+    else:
         return
-    # priority hits first, then by score
-    ranked = sorted(pend, key=lambda h: (not h.get("priority"), -h.get("score", 0), -h.get("published_ts", 0)))
-    send, n_ai = [], 0
-    for h in ranked:
-        if h.get("topic") == "AI":
-            if n_ai >= AI_MAX_HITS_PER_POST:
-                continue
-            n_ai += 1
-        send.append(h)
-        if len(send) >= MAX_HITS_PER_WEBHOOK:
-            break
+    for h in send:
+        if h.get("detected_ts"):
+            h["dispatch_lag_s"] = round(t - h["detected_ts"])
     payload = {
         "event": "herald_breaking_news",
         "account": "@JhMpologoma",
@@ -1115,17 +1224,21 @@ def maybe_escalate(st: dict, dry: bool):
         "count": len(send),
         "priority": any(h.get("priority") for h in send),
         "fast_lane": fast_lane,
+        "urgent": fast_lane,
         "instance": INSTANCE,
         "topics": sorted({h.get("topic", "?") for h in send}),
         "hits": send,
         "queue_file": QUEUE_PATH,
         "mode": "breaking-news (markets, macro, crypto, AI, tech, world)",
-        "instructions": "Verify each hit at the official or a reputable source before posting (never post from "
+        "instructions": ("URGENT: post this first if it verifies; speed matters. " if fast_lane else "") +
+                        "Verify each hit at the official or a reputable source before posting (never post from "
                         "another account's post alone). Write in our own words, Watcher-Guru-style 'JUST IN:' format "
                         "per ../watcher-guru-style.md. Mark handled in breaking-queue.jsonl.",
     }
     if dry:
         log.info("[dry-run] would escalate %d hit(s) (topics %s)%s", len(send), payload["topics"], " FAST-LANE" if fast_lane else "")
+        sent = {id(h) for h in send}
+        st["pending_escalation"] = [h for h in pend if id(h) not in sent]
         return
     if post_webhook(cfg, payload):
         esc["count"] += 1
@@ -1133,11 +1246,12 @@ def maybe_escalate(st: dict, dry: bool):
         sent = {id(h) for h in send}
         # unsent lower-ranked hits stay pending for the next window while still fresh
         st["pending_escalation"] = [h for h in pend if id(h) not in sent]
-        log.info("escalated %d hit(s) [%s]%s; %d still pending; %d/%d today",
+        log.info("escalated %d hit(s) [%s]%s; dispatch lag %ss; %d still pending; %d/%d today",
                  len(send), ",".join(payload["topics"]), " FAST-LANE" if fast_lane else "",
+                 ",".join(str(h.get("dispatch_lag_s", "?")) for h in send),
                  len(st["pending_escalation"]), esc["count"], ESC_MAX_PER_DAY)
     else:
-        esc["last"] = t - ESC_MIN_GAP_S + 120   # retry in ~2 min
+        esc["last"] = t      # retry: urgent after 30 s, normal batch after ESC_MIN_GAP_S
 
 
 # ------------------------------------------------------------------ cycle
@@ -1163,18 +1277,31 @@ def is_fast_lane(name: str, it: dict, score: int) -> bool:
     return bool(FAST_LANE_DOMAINS.search(host))
 
 
-def poll_feed(name: str, url: str, tier: str, topic: str, st: dict, t: float, first_run: bool, dry: bool) -> list[dict]:
+def poll_feed(name: str, url: str, tier: str, topic: str, st: dict, t: float, first_run: bool, dry: bool,
+              raw=None) -> list[dict]:
     seen = st.setdefault("seen_urls", {})
     recent = st.setdefault("recent_hits", [])
     health = st.setdefault("feed_health", {})
     try:
-        items = fetch_feed(name, url, st)
+        if raw is None:
+            items = fetch_feed(name, url, st)
+        elif isinstance(raw, BaseException):
+            raise raw
+        else:
+            items = fetch_finish(url, st, *raw)
         prev = health.get(name, {})
         health[name] = {"ok": True, "t": t, "n": len(items) if items else prev.get("n", 0)}
     except Exception as e:
         health[name] = {"ok": False, "t": t, "err": str(e)[:120]}
         log.warning("feed %s failed: %s", name, e)
+        code = getattr(e, "code", None)
+        if code in (401, 403, 429):         # blocked / rate-limited: back off the whole host politely
+            hb = st.setdefault("host_backoff", {}).setdefault(host_of(url), {"n": 0, "until": 0})
+            secs = HOST_BACKOFF_S[min(hb["n"], len(HOST_BACKOFF_S) - 1)]
+            hb.update(n=hb["n"] + 1, until=t + secs)
+            log.warning("host %s backed off %ds after HTTP %s", host_of(url), secs, code)
         return []
+    st.get("host_backoff", {}).pop(host_of(url), None)
     hits = []
     primed = st.setdefault("primed_feeds", {})
     was_primed = bool(primed.get(name))
@@ -1214,6 +1341,10 @@ def poll_feed(name: str, url: str, tier: str, topic: str, st: dict, t: float, fi
             else:
                 sc, why, clean, item_topic = score_news(name, tier, it, topic)
                 thr = CRYPTO_HIT_THRESHOLD if item_topic == "Crypto" else NEWS_HIT_THRESHOLD
+        if name in OFFICIAL_MAJOR and sc > -50:
+            rx, floor = OFFICIAL_MAJOR[name]
+            if rx.search(clean if topic != "AI" else it["title"]):
+                sc = max(sc, floor); why = list(why) + ["official-major"]
         if sc < thr:
             continue
         if item_topic == "AI":
@@ -1235,7 +1366,7 @@ def poll_feed(name: str, url: str, tier: str, topic: str, st: dict, t: float, fi
             "source": name + (f" ({it['src']})" if it.get("src") else ""),
             "title": clean, "url": it["link"], "score": sc, "kind": kind_for(why, item_topic),
             "why": why, "published_eat": eat(it["date"]), "published_ts": it["date"], "age_min": round(age_min),
-            "detect_lag_s": round(t - it["date"]), "handled": False,
+            "detect_lag_s": round(t - it["date"]), "detected_ts": round(t, 1), "handled": False,
             "priority": is_fast_lane(name, it, sc), "instance": INSTANCE,
         })
         if name == FJ_NAME:
@@ -1244,51 +1375,82 @@ def poll_feed(name: str, url: str, tier: str, topic: str, st: dict, t: float, fi
     return hits
 
 
+_POOL: ThreadPoolExecutor | None = None
+
+
+def _record_hits(st: dict, hits: list[dict], dry: bool):
+    if hits and not dry:
+        with open(QUEUE_PATH, "a") as f:
+            for h in hits:
+                f.write(json.dumps(h, ensure_ascii=False) + "\n")
+    st.setdefault("pending_escalation", []).extend(hits)
+    for h in hits:
+        log.info("HIT [%s %s %s] %s | %s | lag %ss | %s", h.get("topic"), h["kind"], h["score"], h["title"],
+                 h["source"], h.get("detect_lag_s", 0), h["url"])
+
+
 def cycle(st: dict, dry: bool, force_all: bool = False) -> list[dict]:
-    """Poll every feed whose interval has elapsed (all of them if force_all)."""
-    t = now_ts()
+    """Fetch every feed whose interval has elapsed (all of them if force_all) in parallel; process each
+    feed as soon as it returns and dispatch urgent hits at once (latency pass 2026-10-26)."""
+    global _POOL
+    t = t0 = now_ts()
     first_run = not st.get("seen_urls")
     last_fetch = st.setdefault("feed_last_fetch", {})
-    hits, polled = [], 0
+    backoff = st.setdefault("host_backoff", {})
+    due = []
     for name, url, tier, interval in FEEDS:
-        if not force_all and t - last_fetch.get(name, 0) < interval:
+        if not force_all and t - last_fetch.get(name, 0) < max(interval, MIN_FEED_INTERVAL_S):
+            continue
+        if backoff.get(host_of(url), {}).get("until", 0) > t:
             continue
         last_fetch[name] = t
         topic = "AI" if name in AI_FEED_NAMES else ("Crypto" if name in CRYPTO_FEED_NAMES else "")
-        hits += poll_feed(name, url, tier, topic, st, t, first_run, dry)
-        polled += 1
-        if _stop:
-            break
+        due.append((name, url, tier, topic, fetch_prepare(url, st)))
+    hits = []
+    if due:
+        if _POOL is None:
+            _POOL = ThreadPoolExecutor(max_workers=FETCH_WORKERS, thread_name_prefix="fetch")
+        futs = {_POOL.submit(fetch_http, url, hdr): (name, url, tier, topic) for name, url, tier, topic, hdr in due}
+        for fut in as_completed(futs):
+            name, url, tier, topic = futs[fut]
+            try:
+                raw = fut.result()
+            except Exception as e:
+                raw = e
+            new = poll_feed(name, url, tier, topic, st, now_ts(), first_run, dry, raw=raw)
+            if new:
+                _record_hits(st, new, dry)
+                hits += new
+                if any(is_urgent(h) for h in new):
+                    maybe_escalate(st, dry)          # don't wait for the slowest feed in this tick
+    polled = len(due)
     if PRICE_ALERTS_ENABLED:
         for key, every, fn in (("_crypto_px", CRYPTO_POLL_S, check_crypto_prices),
                                ("_market_px", MARKET_POLL_S, check_market_prices)):
             if force_all or t - last_fetch.get(key, 0) >= every:
                 last_fetch[key] = t
                 try:
-                    for h in fn(st):
-                        h.update(ts_eat=eat(t), handled=False)
-                        hits.append(h)
+                    px = fn(st)
+                    for h in px:
+                        h.update(ts_eat=eat(t), handled=False, detected_ts=round(now_ts(), 1))
+                    _record_hits(st, px, dry)
+                    hits += px
                 except Exception as e:
                     log.warning("price check %s failed: %s", key, e)
 
     # prune state
+    t = now_ts()
     st["seen_urls"] = {u: ts for u, ts in st.get("seen_urls", {}).items() if t - ts < 4 * 86400}
     st["recent_hits"] = [r for r in st.get("recent_hits", []) if t - r["t"] < 48 * 3600]
     st["ai_stories"] = {k: v for k, v in st.get("ai_stories", {}).items() if t - v < AI_STORY_DEDUPE_S}
     st["stories"] = {k: v for k, v in st.get("stories", {}).items() if t - v < STORY_DEDUPE_S}
+    st["host_backoff"] = {h: v for h, v in backoff.items() if v.get("until", 0) > t - 3600}
     st.pop("price_hist", None)
 
-    if hits and not dry:
-        with open(QUEUE_PATH, "a") as f:
-            for h in hits:
-                f.write(json.dumps(h, ensure_ascii=False) + "\n")
-        st.setdefault("pending_escalation", []).extend(hits)
-    for h in hits:
-        log.info("HIT [%s %s %s] %s | %s | lag %ss | %s", h.get("topic"), h["kind"], h["score"], h["title"],
-                 h["source"], h.get("detect_lag_s", 0), h["url"])
     maybe_escalate(st, dry)
     if polled or hits:
-        st["last_cycle"] = {"t": t, "eat": eat(t), "feeds_polled": polled, "hits": len(hits)}
+        st["last_cycle"] = {"t": t, "eat": eat(t), "feeds_polled": polled, "hits": len(hits),
+                            "secs": round(now_ts() - t0, 1)}
     return hits
 
 
@@ -1329,14 +1491,14 @@ def main():
             hits = cycle(st, a.dry_run, force_all=a.once)
             lc = st.get("last_cycle", {})
             n_cycles += 1
-            if hits or n_cycles % 20 == 0:      # summary every ~5 min, or when something hit
+            if hits or n_cycles % 60 == 0:      # summary every ~5 min, or when something hit
                 ok = sum(1 for v in st.get("feed_health", {}).values() if v.get("ok"))
                 log.info("tick: %d hit(s) | feeds ok %d/%d | last poll %s", len(hits), ok,
                          len(st.get("feed_health", {})), lc.get("eat"))
         except Exception as e:
             log.exception("cycle crashed: %s", e)
             hits = []
-        if not a.dry_run:
+        if not a.dry_run and (a.once or st.get("last_cycle", {}).get("t", 0) >= time.time() - TICK_SECONDS - 60):
             save_state(st)
         if a.once:
             if a.dry_run:

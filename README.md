@@ -17,3 +17,10 @@ analyst ratings, small % ticks, intercepts/unconfirmed claims) and only passes m
 big US data surprises, record/crash market moves, war shocks on capitals or nuclear sites, leader deaths/resignations,
 $10B+ deals, tariffs/sanctions/executive orders) scoring >= 12 (normal news minimum is 9). Not fast-lane unless
 wire-attributed and score >= 14. First fetch only primes the feed. Turn off with `HERALD_FJ=0`.
+
+## Latency pass (2026-10-26)
+Parallel fetching (one pass of 90 feeds in ~7-14 s), 30-60 s poll intervals on wires/official feeds when run continuously,
+new central-bank/official feeds (Fed monetary, White House actions, ECB, BoE, BoJ, BoC, BEA) and Google News Reuters
+business/markets, central-bank and megacap-deal queries. Urgent hits are sent at once on their own; batches every 3 min; cap 60/day.
+The Reuters direct sitemap is behind a bot wall (HTTP 401) and was removed. Cron moved to minute 2,7,12,... to dodge
+GitHub's top-of-hour load.
