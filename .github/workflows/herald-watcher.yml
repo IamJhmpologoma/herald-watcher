@@ -22,7 +22,7 @@ jobs:
       HERALD_WEBHOOK_ENV: /dev/null
       HERALD_WEBHOOK_URL: ${{ secrets.HERALD_WEBHOOK_URL }}
       HERALD_WEBHOOK_KEY: ${{ secrets.HERALD_WEBHOOK_KEY }}
-      HERALD_WEBHOOK_AUTH_HEADER: both
+      HERALD_WEBHOOK_AUTH_HEADER: Authorization
       HERALD_WEBHOOK_AUTH_SCHEME: Bearer
     steps:
       - uses: actions/checkout@v4
