@@ -1446,6 +1446,8 @@ def cycle(st: dict, dry: bool, force_all: bool = False) -> list[dict]:
     st["stories"] = {k: v for k, v in st.get("stories", {}).items() if t - v < STORY_DEDUPE_S}
     st["host_backoff"] = {h: v for h, v in backoff.items() if v.get("until", 0) > t - 3600}
     st.pop("price_hist", None)
+    names = {f[0] for f in FEEDS}            # drop health rows of removed feeds (e.g. the Reuters sitemap)
+    st["feed_health"] = {k: v for k, v in st.get("feed_health", {}).items() if k in names}
 
     maybe_escalate(st, dry)
     if polled or hits:
