@@ -1,0 +1,1222 @@
+#!/usr/bin/env python3
+"""
+Herald breaking-news watcher for @JhMpologoma ("Mr Update").
+Since 2026-10-25 ~20:00 EAT: a broad Watcher-Guru-style breaking-news watcher
+(markets, macro, crypto, AI, big tech/business, world headlines). Style guide: ../watcher-guru-style.md
+
+No AI calls. Each feed has its own poll interval (fast wires/markets/crypto every 60-90s,
+Google News searches every 150-240s, slow blogs every 3-9 min); conditional GETs (ETag /
+Last-Modified) where the server supports them. Items are scored with keyword rules, deduped,
+appended to ../breaking-queue.jsonl and escalated in batches to the webhook routine.
+Big-mover price alerts: BTC/ETH/SOL/XRP (CoinGecko) and gold, S&P 500, Nasdaq 100, WTI oil
+futures (Yahoo Finance chart API).
+
+Usage:
+  watcher.py                   run forever
+  watcher.py --once            one pass over every feed (writes state/queue, may escalate)
+  watcher.py --once --dry-run  one pass, prints hits, writes/escalates nothing
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import email.utils
+import html
+import json
+import logging
+import logging.handlers
+import os
+import random
+import re
+import signal
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
+from zoneinfo import ZoneInfo
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+HERALD = os.path.dirname(HERE)
+STATE_PATH = os.environ.get("HERALD_STATE_PATH") or os.path.join(HERE, "state.json")
+LOG_PATH = os.environ.get("HERALD_LOG_PATH") or os.path.join(HERE, "watcher.log")
+QUEUE_PATH = os.environ.get("HERALD_QUEUE_PATH") or os.path.join(HERALD, "breaking-queue.jsonl")
+WEBHOOK_ENV = os.environ.get("HERALD_WEBHOOK_ENV") or os.path.join(HERE, "webhook.env")
+INSTANCE = os.environ.get("HERALD_INSTANCE", "box")   # "box" or e.g. "gha" (always-on copy)
+TZ = ZoneInfo("Africa/Kampala")
+TICK_SECONDS = 15                   # main loop tick; each feed has its own interval below
+MAX_AGE_MIN = 45                    # breaking: drop items published more than 45 min ago
+FIRST_RUN_MAX_AGE_MIN = 45
+UA = "Mozilla/5.0 (X11; Linux x86_64) HeraldWatcher/2.0 (+news monitor for @JhMpologoma)"
+TIMEOUT = 15
+
+# ---- topic switches (2026-10-25 ~20:00 EAT: everything on again; env can still turn parts off)
+CRYPTO_ENABLED = os.environ.get("HERALD_CRYPTO", "1") == "1"
+PRICE_ALERTS_ENABLED = os.environ.get("HERALD_PRICES", "1") == "1"
+NEWS_ENABLED = os.environ.get("HERALD_NEWS", "1") == "1"
+
+# ---- webhook limits (breaking-news level)
+ESC_MIN_GAP_S = 8 * 60              # at most one webhook every 8 minutes
+ESC_MAX_PER_DAY = 40                # per EAT day
+MAX_HITS_PER_WEBHOOK = 6            # several hits batched per webhook, best first
+AI_MAX_HITS_PER_POST = 3            # AI can't crowd out the rest of a batch
+AI_HIT_THRESHOLD = 9
+AI_MAX_AGE_H = MAX_AGE_MIN / 60
+NEWS_HIT_THRESHOLD = 9
+CRYPTO_HIT_THRESHOLD = 9
+STORY_DEDUPE_S = 3 * 3600           # same entity+event+number story: one hit per 3h
+# ---- fast lane (2026-10-26): top wires/official sources with score >= FAST_LANE_MIN_SCORE skip the
+# 8-minute gap (daily cap still applies) and are flagged priority:true in the webhook payload.
+FAST_LANE_MIN_SCORE = 10
+FAST_LANE_MIN_GAP_S = 60            # anti-burst floor between two fast-lane webhooks
+FAST_LANE_DOMAINS = re.compile(r"(^|\.)(reuters\.com|apnews\.com|bloomberg\.com|bbc\.co\.uk|bbc\.com|nikkei\.com|"
+                               r"federalreserve\.gov|sec\.gov|whitehouse\.gov|treasury\.gov|bls\.gov|[a-z0-9-]+\.gov)$", re.I)
+FAST_LANE_PUBLISHERS = re.compile(r"^(reuters|associated press|ap news|bloomberg|bbc|bbc news|nikkei asia|nikkei|"
+                                  r"the white house|federal reserve|u\.s\. department of the treasury|bureau of labor statistics)\b", re.I)
+FAST_LANE_FEEDS = re.compile(r"^(Reuters|BBC|Nikkei|Federal Reserve|SEC press|White House|GN: (Reuters|AP|Bloomberg|treasury\.gov|bls\.gov))", re.I)
+AI_STORY_DEDUPE_S = 12 * 3600
+
+def gnews(q: str) -> str:
+    return ("https://news.google.com/rss/search?q=" + urllib.parse.quote(q)
+            + "&hl=en-US&gl=US&ceid=US:en")
+# name, url, tier (official | reputable | aggregator), poll interval (s)
+# All checked with curl on 2026-10-25 ~19:50 EAT (HTTP 200, parseable, fresh items).
+NEWS_FEEDS = [
+    # wires / markets (fast)
+    ("CNBC Top News", "https://www.cnbc.com/id/100003114/device/rss/rss.html", "reputable", 60),
+    ("CNBC World", "https://www.cnbc.com/id/100727362/device/rss/rss.html", "reputable", 75),
+    ("CNBC Markets", "https://www.cnbc.com/id/15839069/device/rss/rss.html", "reputable", 75),
+    ("CNBC Economy", "https://www.cnbc.com/id/20910258/device/rss/rss.html", "reputable", 90),
+    ("CNBC Investing", "https://www.cnbc.com/id/15839135/device/rss/rss.html", "reputable", 90),
+    ("MarketWatch Bulletins", "https://feeds.content.dowjones.io/public/rss/mw_bulletins", "reputable", 75),
+    ("MarketWatch Top", "https://feeds.content.dowjones.io/public/rss/mw_topstories", "reputable", 90),
+    ("MarketWatch Pulse", "https://feeds.content.dowjones.io/public/rss/mw_marketpulse", "reputable", 90),
+    ("WSJ Markets", "https://feeds.content.dowjones.io/public/rss/RSSMarketsMain", "reputable", 90),
+    ("WSJ World", "https://feeds.content.dowjones.io/public/rss/RSSWorldNews", "reputable", 90),
+    ("Yahoo Finance", "https://feeds.finance.yahoo.com/rss/2.0/headline?s=%5EGSPC,%5EIXIC,BTC-USD,NVDA,TSLA&region=US&lang=en-US", "reputable", 120),
+    ("BBC World", "https://feeds.bbci.co.uk/news/world/rss.xml", "reputable", 120),
+    ("BBC Business", "https://feeds.bbci.co.uk/news/business/rss.xml", "reputable", 180),
+    ("Al Jazeera", "https://www.aljazeera.com/xml/rss/all.xml", "reputable", 120),
+    ("Guardian Business", "https://www.theguardian.com/business/rss", "reputable", 180),
+    ("NYT World", "https://rss.nytimes.com/services/xml/rss/nyt/World.xml", "reputable", 180),
+    ("NYT Business", "https://rss.nytimes.com/services/xml/rss/nyt/Business.xml", "reputable", 180),
+    # official
+    ("Federal Reserve", "https://www.federalreserve.gov/feeds/press_all.xml", "official", 60),
+    ("SEC press releases", "https://www.sec.gov/news/pressreleases.rss", "official", 90),
+    ("White House", "https://www.whitehouse.gov/news/feed/", "official", 90),
+    # treasury.gov has no working RSS (404) and bls.gov returns 403 to scripts: Google News site: fallbacks
+    ("GN: treasury.gov", gnews("site:home.treasury.gov when:1d"), "official", 240),
+    ("GN: bls.gov", gnews("site:bls.gov when:1d"), "official", 240),
+    # Google News top-story searches (aggregator tier; publisher shown in item)
+    ("GN: Trump", gnews("Trump (announces OR signs OR tariff OR \"executive order\" OR says) when:1h"), "aggregator", 150),
+    ("GN: Fed/rates", gnews("(\"Federal Reserve\" OR Powell OR \"rate cut\" OR \"rate hike\" OR FOMC) when:1h"), "aggregator", 150),
+    ("GN: tariffs/trade", gnews("(tariff OR tariffs OR sanctions OR \"trade deal\") when:1h"), "aggregator", 180),
+    ("GN: US data", gnews("(CPI OR inflation OR \"jobs report\" OR payrolls OR GDP OR PPI OR unemployment) report when:1h"), "aggregator", 180),
+    ("GN: Nvidia/Tesla/Musk", gnews("(Nvidia OR Tesla OR SpaceX OR \"Elon Musk\") when:1h"), "aggregator", 180),
+    ("GN: Big Tech", gnews("(Apple OR Microsoft OR Amazon OR Alphabet OR Meta) (earnings OR revenue OR announces OR lawsuit OR fined OR acquire) when:1h"), "aggregator", 240),
+    ("GN: Wall St banks", gnews("(JPMorgan OR BlackRock OR Goldman OR \"Bank of America\" OR \"Wells Fargo\" OR Citi) when:1h"), "aggregator", 240),
+    ("GN: markets moves", gnews("(\"stock market\" OR \"S&P 500\" OR Nasdaq OR Dow OR gold OR oil) (record OR plunges OR surges OR crash OR wiped OR soars) when:1h"), "aggregator", 180),
+    ("GN: world breaking", gnews("(war OR missile OR ceasefire OR attack OR earthquake OR emergency OR coup) (Russia OR Ukraine OR China OR Taiwan OR Israel OR Iran OR NATO OR \"North Korea\") when:1h"), "aggregator", 180),
+    ("GN: Reuters", gnews("site:reuters.com when:1h"), "reputable", 180),
+    ("GN: AP", gnews("site:apnews.com when:1h"), "reputable", 240),
+    ("GN: Bloomberg", gnews("site:bloomberg.com when:1h"), "reputable", 180),
+    # ---- speed fixes 2026-10-26: direct wires + world/politics (all curl-checked 2026-10-26 ~09:00 EAT)
+    # Reuters has no public RSS; its Google-News sitemap is direct, updated within a minute, ETag-aware.
+    ("Reuters (sitemap)", "https://www.reuters.com/arc/outboundfeeds/news-sitemap/?outputType=xml", "reputable", 60),
+    ("GN: Reuters world", gnews("site:reuters.com/world when:1h"), "reputable", 150),
+    ("BBC Top Stories", "https://feeds.bbci.co.uk/news/rss.xml", "reputable", 75),
+    ("BBC Africa", "https://feeds.bbci.co.uk/news/world/africa/rss.xml", "reputable", 240),
+    ("Nikkei Asia", "https://asia.nikkei.com/rss/feed/nar", "reputable", 120),       # undated items: first-seen time used
+    ("Japan Times", "https://www.japantimes.co.jp/feed/", "reputable", 240),
+    ("Guardian World", "https://www.theguardian.com/world/rss", "reputable", 150),
+    ("DW", "https://rss.dw.com/rdf/rss-en-all", "reputable", 180),
+    ("France 24", "https://www.france24.com/en/rss", "reputable", 180),
+    ("Sky News World", "https://feeds.skynews.com/feeds/rss/world.xml", "reputable", 180),
+    # apnews.com RSS returns 403 to scripts; NHK World English feed 404 / Japanese feed stale: Google News fallbacks
+    ("GN: NHK World", gnews("site:www3.nhk.or.jp/nhkworld when:1h"), "reputable", 240),
+    ("GN: election results", gnews('("election results" OR concedes OR "wins election" OR "wins presidency" OR "sworn in" OR runoff OR "re-elected" OR "wins re-election" OR landslide) when:1h'), "aggregator", 120),
+    ("GN: leaders", gnews('("prime minister" OR president OR king OR pope) (resigns OR "steps down" OR dies OR died OR impeached OR ousted OR assassinated OR arrested) when:1h'), "aggregator", 120),
+    ("GN: world breaking 2", gnews('(coup OR invasion OR assassination OR earthquake OR tsunami OR "state of emergency" OR "martial law" OR ceasefire) when:1h'), "aggregator", 120),
+    ("GN: Africa", gnews('(Uganda OR Kenya OR Nigeria OR "South Africa" OR Ethiopia OR Ghana OR Tanzania OR Rwanda) (president OR election OR protest OR central bank OR dies OR coup) when:2h'), "aggregator", 240),
+]
+
+CRYPTO_FEEDS = [
+    ("CoinDesk", "https://www.coindesk.com/arc/outboundfeeds/rss/", "reputable", 90),
+    ("The Block", "https://www.theblock.co/rss.xml", "reputable", 60),
+    ("Cointelegraph", "https://cointelegraph.com/rss", "reputable", 60),
+    ("Decrypt", "https://decrypt.co/feed", "reputable", 75),
+    ("Bitcoin Magazine", "https://bitcoinmagazine.com/feed", "reputable", 180),
+    ("DL News", "https://www.dlnews.com/arc/outboundfeeds/rss/", "reputable", 180),
+    ("Coinbase status", "https://status.coinbase.com/history.rss", "official", 180),
+    ("GN: ripple.com", gnews("site:ripple.com when:1d"), "official", 300),
+    ("GN: Bitcoin", gnews("(Bitcoin OR BTC) (ETF OR buys OR reserve OR falls OR surges OR record OR liquidated) when:1h"), "aggregator", 150),
+    ("GN: crypto policy", gnews("(crypto OR stablecoin OR \"digital asset\") (SEC OR Congress OR Senate OR Treasury OR bill OR \"executive order\" OR ban OR approves) when:1h"), "aggregator", 180),
+    ("GN: crypto hack", gnews("(crypto OR exchange OR DeFi OR bridge) (hack OR exploit OR drained OR insolvency OR \"withdrawals halted\") when:2h"), "aggregator", 180),
+    ("GN: ETH/SOL/XRP", gnews("(Ethereum OR Solana OR XRP OR Ripple) (ETF OR approves OR launches OR partnership OR record) when:1h"), "aggregator", 240),
+]
+
+# AI feeds (all checked with curl on 2026-10-25). Same tuple shape.
+AI_FEEDS = [
+    ("OpenAI news", "https://openai.com/news/rss.xml", "official"),
+    ("Google AI blog", "https://blog.google/technology/ai/rss/", "official"),
+    ("Google DeepMind blog", "https://deepmind.google/blog/rss.xml", "official"),
+    ("Meta newsroom", "https://about.fb.com/news/feed/", "official"),
+    ("NVIDIA newsroom", "https://nvidianews.nvidia.com/releases.xml", "official"),
+    ("Mistral AI news", "https://mistral.ai/rss.xml", "official"),
+    # anthropic.com and x.ai have no RSS (404); Google News site: queries are the fallback
+    ("GN: anthropic.com", gnews("site:anthropic.com when:1d"), "official"),
+    ("GN: x.ai", gnews("site:x.ai when:1d"), "official"),
+    ("TechCrunch AI", "https://techcrunch.com/category/artificial-intelligence/feed/", "reputable"),
+    ("The Verge AI", "https://www.theverge.com/rss/ai-artificial-intelligence/index.xml", "reputable"),
+    ("Ars Technica AI", "https://arstechnica.com/ai/feed/", "reputable"),
+    ("CNBC Technology", "https://www.cnbc.com/id/19854910/device/rss/rss.html", "reputable"),
+    # venturebeat.com feeds return 429 to scripts
+    ("GN: venturebeat.com", gnews("site:venturebeat.com when:1d"), "reputable"),
+    ("GN: AI top-5 events", gnews('(OpenAI OR Anthropic OR xAI OR Gemini OR "Meta AI" OR ChatGPT OR Claude OR Grok) '
+                                  '(launches OR unveils OR raises OR funding OR valuation OR lawsuit OR outage '
+                                  'OR acquires OR releases) when:1d'), "aggregator"),
+]
+# AI security sources (checked with curl on 2026-10-25). General security feeds must mention AI.
+AI_SEC_FEEDS_LIST = [
+    ("The Hacker News", "https://feeds.feedburner.com/TheHackersNews", "reputable"),
+    ("BleepingComputer", "https://www.bleepingcomputer.com/feed/", "reputable"),
+    ("SecurityWeek AI", "https://www.securityweek.com/category/artificial-intelligence/feed/", "reputable"),
+    ("GN: AI security", gnews('("prompt injection" OR jailbreak OR jailbroken OR deepfake OR "data leak" OR '
+                              '"AI security" OR vulnerability OR malware) (ChatGPT OR OpenAI OR Claude OR Anthropic '
+                              'OR Gemini OR Grok OR Copilot OR "AI agent" OR LLM) when:1d'), "aggregator"),
+]
+AI_FEEDS = AI_FEEDS + AI_SEC_FEEDS_LIST
+AI_SEC_FEEDS = {n for n, _, _ in AI_SEC_FEEDS_LIST}
+AI_FEED_NAMES = {n for n, _, _ in AI_FEEDS}
+# AI feed intervals (s): official blogs are slow-moving; OpenAI's feed is 800 KB with no ETag.
+AI_FEED_INTERVAL = {"OpenAI news": 9 * 60, "Mistral AI news": 6 * 60, "Google DeepMind blog": 5 * 60,
+                    "Google AI blog": 4 * 60, "Meta newsroom": 4 * 60}
+AI_FEEDS4 = [(n, u, t, AI_FEED_INTERVAL.get(n, 180)) for n, u, t in AI_FEEDS]
+
+FEEDS = ((NEWS_FEEDS if NEWS_ENABLED else []) + (CRYPTO_FEEDS if CRYPTO_ENABLED else []) + AI_FEEDS4)
+NEWS_FEED_NAMES = {f[0] for f in NEWS_FEEDS}
+CRYPTO_FEED_NAMES = {f[0] for f in CRYPTO_FEEDS}
+
+# general-purpose AI feeds: item must mention AI
+AI_REQUIRED = {"Meta newsroom", "CNBC Technology", "NVIDIA newsroom", "The Hacker News", "BleepingComputer"}
+AI_OFFICIAL_TOP5 = {"OpenAI news", "Google AI blog", "Google DeepMind blog", "GN: anthropic.com", "GN: x.ai"}
+
+CRYPTO_TERM = re.compile(r"crypto|bitcoin|digital asset|stablecoin|blockchain|token|"
+                         r"\bxrp\b|ethereum|\bbtc\b|virtual currenc", re.I)
+IMPACT = re.compile(
+    r"\betfs?\b|\bsec\b|approv|lawsuit|\bsues?\b|settle|\bhack|exploit|drain|stolen|"
+    r"partnership|partners with|\blaunch|upgrade|amendment|mainnet|\bbanks?\b|\bfed\b|"
+    r"federal reserve|\bban(s|ned)?\b|liquidat|record|all-time high|\bath\b|inflows?|outflows?|"
+    r"acquir|acquisition|listing|delist|charter|license|regulat|bill\b|senate|congress|"
+    r"treasury|reserve|crash|plunge|surge|soar|tumble|halt|outage|bankrupt|insolven|"
+    r"slips?|drops?|falls?|jumps?|rall(y|ies)|breaks?|longs|shorts|wiped|freez|seiz|arrest|"
+    r"tokeniz|stablecoin|custody|integrat|adopt",
+    re.I)
+BIG_EVENT = re.compile(
+    r"(exchange|bridge|protocol|wallet).{0,40}(hack|exploit|drain|breach)|"
+    r"(hack|exploit|drain|breach).{0,40}(exchange|bridge|protocol)|"
+    r"insolven|bankrupt|withdrawals? (halt|paus|suspend)|halts? withdrawals|"
+    r"(sec|cftc|congress|senate|white house|treasury).{0,60}(crypto|stablecoin|digital asset)|"
+    r"(crypto|stablecoin|digital asset).{0,60}(bill|law|executive order|framework).{0,30}(pass|sign|approv|vote)",
+    re.I)
+MONEY = re.compile(r"\$\s?(\d+(?:\.\d+)?)\s?(million|m\b|billion|bn|b\b)", re.I)
+CLICKBAIT = re.compile(
+    r"price prediction|predicts?|could (reach|hit|soar|explode)|will (hit|reach|soar)|"
+    r"to the moon|here'?s why|here is why|top \d+|best crypto|\bpresale\b|\d+x\b|"
+    r"millionaire|should you buy|is it too late|price analysis|technical analysis|"
+    r"what'?s next for|next \d+ (days|hours)|expert says|analyst says|"
+    r"\bwhale\b.*\b(buys?|sells?|moves?)\b|sentiment|chart pattern|\beyes\b|breakout|"
+    r"\btargets?\b|price faces|downside risk|bullish|bearish|^live:|\bprice today\b", re.I)
+SPAM = re.compile(r"sponsored|press release|partner content|\bpr\b:|advertorial|"
+                  r"globenewswire|prnewswire|accesswire|business wire|newsfile|"
+                  r"benzinga pro|coinpedia|crypto-economy|zycrypto|coingape|"
+                  r"thecryptobasic|times tabloid|bitcoinist|newsbtc|captainaltcoin|"
+                  r"crypto news flash|finbold|watcher\.guru|ambcrypto|pluang|traders union|"
+                  r"hokanews|cryptopolitan|cryptoticker|coin gabbar|techbullion|streetinsider|"
+                  r"cryptonewsz|coincodex|blockchain reporter|crypto daily|bitget|kucoin|"
+                  r"binance square|mexc|tradingview|investinglive|economies\.com", re.I)
+QUESTION_BAIT = re.compile(r"\?\s*$|worth buying|buy now|should you|is it time", re.I)
+# ---- AI scoring
+AI_TOP5 = {
+    "openai": r"\bopenai\b|chatgpt|\bgpt-?\d|\bsora\b|sam altman|\baltman\b|\bo\d(-mini|-pro)?\b(?=.*model)",
+    "google": r"\bgemini\b|deepmind|\bgoogle\b.{0,40}\b(ai|model|chatbot)\b|\bsundar pichai\b.{0,60}\bai\b|\bveo\b|\bimagen\b",
+    "anthropic": r"anthropic|\bclaude\b|dario amodei",
+    "xai": r"\bxai\b|\bgrok\b|colossus",
+    "meta": r"\bllama\b|meta ai\b|meta superintelligence|\bmeta\b.{0,40}\b(ai|model|superintelligence)\b|zuckerberg.{0,60}\bai\b",
+}
+AI_OTHER = re.compile(
+    r"\bnvidia\b|jensen huang|copilot|apple intelligence|\bsiri\b.{0,30}\b(ai|gemini|llm)\b|mistral|deepseek|"
+    r"perplexity|\bqwen\b|alibaba.{0,30}\bai\b|microsoft.{0,40}\b(ai|openai)\b|amazon.{0,30}\b(ai|anthropic|nova)\b|"
+    r"hugging ?face|safe superintelligence|\bssi\b|thinking machines|ilya sutskever|moonshot|\bkimi\b|"
+    r"\bagi\b|superintelligence", re.I)
+AI_TERM = re.compile(r"\bai\b|artificial intelligence|machine learning|\bllms?\b|chatbot|"
+                     r"language model|generative|\bagents?\b|gpu|data center|openai|gemini|claude|grok|llama|"
+                     r"copilot|superintelligence|nvidia|anthropic|\bxai\b|deepseek|mistral|\bchips?\b", re.I)
+AI_EVENT = re.compile(
+    r"\blaunch(es|ed)?\b|\breleas(e|es|ed)\b|\bunveil|\bintroduc(es|ing|ed)\b|\bdebuts?\b|\bannounc|"
+    r"\brais(es|ed|ing)\b|\bfunding\b|\bvaluation\b|\bvalued\b|\bipo\b|\bacquir|\bacquisition\b|\bbuys\b|"
+    r"\bmerger\b|\bdeal\b|\bpartnership\b|\blawsuit\b|\bsues?\b|\bsued\b|\bcourt\b|\bruling\b|\bsettle|"
+    r"\bbans?\b|\bbanned\b|\bregulat|\bantitrust\b|\bprobe\b|\binvestigat|\bfines\b|\bfined\b|executive order|"
+    r"\bai act\b|\bsenate\b|\bcongress\b|\boutage\b|\bdown for\b|\bbreach\b|\bleak(s|ed)?\b|"
+    r"\bresigns?\b|\bsteps down\b|\bfired\b|\bousted\b|\bhires?\b|\blayoffs?\b|\bexport\b|\bchips? (ban|curbs?|rules)\b|"
+    r"\brecord\b|\bopen[- ]sources?\b|\bopen[- ]weights?\b|\bbenchmark\b|\bblock(s|ed)\b",
+    re.I)
+AI_MODEL_VER = re.compile(
+    r"\bgpt-?\d(\.\d+)?\b|\bgemini \d(\.\d+)?\b|\bclaude (\w+ )?\d(\.\d+)?\b|"
+    r"\b(opus|sonnet|haiku) \d|\bgrok \d(\.\d+)?\b|\bllama \d|\bdeepseek[- ]?(v|r)\d|\bsora \d|\bveo \d|"
+    r"\bmistral (large|medium) \d|\bqwen ?\d|\bdeepseek\b.{0,30}\b(v|r)\d", re.I)
+AI_BIG_EVENT = re.compile(
+    r"(openai|anthropic|xai|deepmind|mistral|deepseek|perplexity|nvidia).{0,60}"
+    r"(raises|valuation|valued|ipo|acquires|to acquire|buys|sued|lawsuit|ban|antitrust|outage)|"
+    r"(chatgpt|claude|gemini|grok|copilot).{0,30}(outage|is down|goes down|banned)|"
+    r"(ban|bans|banned|restrict).{0,40}(chatgpt|deepseek|openai|nvidia chips|ai chips)|"
+    r"(ai act|executive order|ai bill|ai law).{0,40}(sign|pass|vote|take effect|delay)|"
+    r"(ceo|cto|chief scientist|co-?founder).{0,40}(resigns|steps down|fired|ousted|leaves)|"
+    r"(sues?|sued|lawsuit against|bans?|blocks|\bfines\b|fined|probe into|antitrust).{0,40}"
+    r"(openai|anthropic|xai|google|meta|nvidia|deepseek|chatgpt|microsoft|apple)|"
+    r"(eu|ftc|doj|sec|regulators?|court|judge).{0,40}(\bfines\b|sues|blocks|bans|orders|rules against)",
+    re.I)
+AI_CLICKBAIT = re.compile(
+    r"you should know|you need to|should change|how to\b|\btips\b|\bguide\b|explained|\breview\b|hands[- ]on|"
+    r"\bi tried\b|\bi asked\b|best ai|\bdeals?\b|% off|\bsale\b|podcast|newsletter|this week in|roundup|"
+    r"\bopinion\b|op-ed|why you|everything we know|what is\b|\bvs\.?\b|\bcheat sheet\b|\bprompts?\b to|"
+    r"\bstocks? to buy\b|price target|\bshares of\b|stake in|\bholdings?\b|\bquiz\b|\bgadgets\b|"
+    r"^watch:|^video:|^live:|\d+ questions|need answered|what (it|this) means for (you|investors)|"
+    r"\bis [\w ]{1,25} down today\b|\bhere'?s (why|what|how)\b|top \d+|\d+ (things|ways|reasons)", re.I)
+# ---- AI security (strict: needs a named AI player, or on a security feed a generic AI target, plus a security event)
+AI_SEC_EVENT = re.compile(
+    r"prompt[- ]injection|jailbr(eak|oken)|deepfake|data leak|\bleak(s|ed)?\b|\bbreach(es|ed)?\b|vulnerab|\bflaws?\b|"
+    r"\bexploit(s|ed)?\b|zero[- ]day|\bcve-\d|malware|backdoor|supply[- ]chain attack|\bhijack|exfiltrat|"
+    r"sandbox escape|\bescapes?\b|\bcompromis|\bst(ole|eal|olen)\b|phishing|ransomware|\bexposed?\b|"
+    r"\bscams?\b|impersonat|voice clon|poison", re.I)
+AI_SEC_SEVERE = re.compile(
+    r"zero[- ]click|actively exploited|\bcritical\b|\bmillions?\b|\bbillions?\b|"
+    r"\d[\d,]* (users|accounts|customers|organi[sz]ations|companies)|supply[- ]chain|\bst(ole|eal|olen)\b|"
+    r"\bhijack|\bescapes?\b|exfiltrat|malware|backdoor|ransomware|zero[- ]day", re.I)
+AI_SEC_GENERIC = re.compile(r"\bai agents?\b|\bagentic\b|\bllms?\b|\bai models?\b|\bmcp\b|litellm|deepfake|"
+                            r"\bai (tools?|platforms?|assistants?|chatbots?|coding|browsers?)\b", re.I)
+AI_SPAM = re.compile(r"marketbeat|fello ai|neoteo|ssbcrack|metroindia|indianweb2|tech-insider\.org|"
+                     r"techstory|analytics insight|aitoolsclub|geeky gadgets|digital journal|stocktwits|"
+                     r"tradingkey|stockstotrade|klse screener|xenospect|pasquale pillitteri|"
+                     r"\bwebinar\b|threatsday|weekly recap", re.I)
+log = logging.getLogger("herald-watcher")
+_stop = False
+
+
+# ------------------------------------------------------------------ utils
+def now_ts() -> float:
+    return time.time()
+
+def eat(ts: float | None = None) -> str:
+    return dt.datetime.fromtimestamp(ts or now_ts(), TZ).strftime("%Y-%m-%d %H:%M:%S EAT")
+
+def setup_logging(verbose: bool):
+    log.setLevel(logging.INFO)
+    fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s", "%Y-%m-%d %H:%M:%S")
+    fh = logging.handlers.RotatingFileHandler(LOG_PATH, maxBytes=1_000_000, backupCount=3)
+    fh.setFormatter(fmt)
+    log.addHandler(fh)
+    if verbose:
+        sh = logging.StreamHandler(sys.stdout)
+        sh.setFormatter(fmt)
+        log.addHandler(sh)
+
+def load_state() -> dict:
+    try:
+        with open(STATE_PATH) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def save_state(st: dict):
+    tmp = STATE_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(st, f)
+    os.replace(tmp, STATE_PATH)
+
+def http_get(url: str, headers: dict | None = None):
+    req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "*/*", **(headers or {})})
+    try:
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
+            return r.status, r.read(3_000_000), dict(r.headers)
+    except urllib.error.HTTPError as e:
+        return e.code, b"", dict(e.headers or {})
+
+def norm_url(u: str) -> str:
+    try:
+        p = urllib.parse.urlsplit(u.strip())
+        q = urllib.parse.parse_qsl(p.query)
+        q = [(k, v) for k, v in q if not k.lower().startswith(("utm_", "ref", "fbclid"))]
+        return urllib.parse.urlunsplit((p.scheme.lower(), p.netloc.lower().removeprefix("www."),
+                                        p.path.rstrip("/"), urllib.parse.urlencode(q), ""))
+    except Exception:
+        return u
+
+STOP = set("a an the of to in on for and or is are as at by with from its it this that be has have "
+           "after over into new says said report reports amid could will".split())
+
+def title_tokens(t: str) -> set:
+    t = re.sub(r"[^a-z0-9$.% ]", " ", t.lower())
+    return {w for w in t.split() if w not in STOP and len(w) > 1}
+
+def similar(a: set, b: set) -> float:
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
+
+def strip_tags(s: str) -> str:
+    return html.unescape(re.sub(r"<[^>]+>", " ", s or "")).strip()
+
+
+# ------------------------------------------------------------------ feeds
+def parse_date(s: str | None) -> float | None:
+    if not s:
+        return None
+    s = s.strip()
+    try:
+        d = email.utils.parsedate_to_datetime(s)
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=dt.timezone.utc)
+        return d.timestamp()
+    except Exception:
+        pass
+    try:
+        d = dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=dt.timezone.utc)
+        return d.timestamp()
+    except Exception:
+        return None
+
+def local(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1].lower()
+
+def parse_feed(data: bytes) -> list[dict]:
+    root = ET.fromstring(data)
+    items = []
+    for el in root.iter():
+        if local(el.tag) not in ("item", "entry"):
+            continue
+        it = {"title": "", "link": "", "date": None, "summary": "", "src": ""}
+        for c in el:
+            n = local(c.tag)
+            if n == "title":
+                it["title"] = strip_tags(c.text or "")
+            elif n == "link":
+                href = c.get("href")
+                if href and (c.get("rel") in (None, "alternate")):
+                    it["link"] = href
+                elif c.text and not it["link"]:
+                    it["link"] = c.text.strip()
+            elif n in ("pubdate", "published", "updated", "date") and not it["date"]:
+                it["date"] = parse_date(c.text)
+            elif n in ("description", "summary") and not it["summary"]:
+                it["summary"] = strip_tags(c.text or "")[:500]
+            elif n == "source":
+                it["src"] = (c.text or "").strip()
+        if it["title"]:
+            items.append(it)
+    # Google News sitemap (Reuters): <url><loc/><news:news><news:publication_date/><news:title/></news:news></url>
+    if not items and local(root.tag) == "urlset":
+        for el in root:
+            if local(el.tag) != "url":
+                continue
+            it = {"title": "", "link": "", "date": None, "summary": "", "src": ""}
+            for c in el.iter():
+                n = local(c.tag)
+                if n == "loc" and not it["link"] and local(c.tag) == "loc" and "/images" not in (c.text or "")[:60]:
+                    it["link"] = (c.text or "").strip()
+                elif n == "title":
+                    it["title"] = strip_tags(c.text or "")
+                elif n == "publication_date":
+                    it["date"] = parse_date(c.text)
+            if it["title"] and it["link"]:
+                items.append(it)
+    return items
+
+def fetch_feed(name: str, url: str, st: dict) -> list[dict]:
+    cache = st.setdefault("http_cache", {}).setdefault(url, {})
+    hdr = {}
+    if cache.get("etag"):
+        hdr["If-None-Match"] = cache["etag"]
+    if cache.get("lm"):
+        hdr["If-Modified-Since"] = cache["lm"]
+    code, body, headers = http_get(url, hdr)
+    if code == 304:
+        return []
+    if code != 200:
+        raise RuntimeError(f"HTTP {code}")
+    h = {k.lower(): v for k, v in headers.items()}
+    cache["etag"] = h.get("etag")
+    cache["lm"] = h.get("last-modified")
+    return parse_feed(body)
+
+# ------------------------------------------------------------------ general (Watcher Guru style) scoring
+# Entity groups (title). Specific match text is used for the story key.
+ENT = {
+    "crypto": re.compile(r"\bbitcoin\b|\bbtc\b|\bethereum\b|\bether\b|\beth\b|\bsolana\b|\bsol\b|\bxrp\b|\bripple\b|"
+                         r"\bstablecoins?\b|\bcrypto(currency|currencies)?\b|\bbinance\b|\bcoinbase\b|\btether\b|\busdt\b|\busdc\b|"
+                         r"\bcircle\b|\bmicrostrategy\b|\bsaylor\b|\bstrategy\b(?=.{0,40}\b(bitcoin|btc)\b)|\bdogecoin\b|\bdoge\b|"
+                         r"\btokeni[sz]|\bdigital assets?\b|\bmemecoin|\bdefi\b|\bblockchain\b|\bhyperliquid\b|\bbnb\b|\bkraken\b|"
+                         r"\bbitmine\b|\bmetaplanet\b|\bgenius act\b|\bclarity act\b", re.I),
+    "macro": re.compile(r"\bfed\b|federal reserve|\bpowell\b|\bfomc\b|interest rates?|rate (cut|hike)s?|\bcpi\b|\bppi\b|"
+                        r"inflation|consumer price index|producer price index|retail sales|\bpmi\b|jobs report|non-?farm|payrolls|unemployment|jobless|\bgdp\b|recession|\btreasury\b|"
+                        r"\bbessent\b|national debt|debt ceiling|\byields?\b|\btariffs?\b|government shutdown|\bimf\b|"
+                        r"central banks?|\becb\b|bank of (japan|england)|\bpboc\b", re.I),
+    "markets": re.compile(r"s&p 500|\bs&p\b|\bnasdaq\b|\bdow\b|stock market|wall street|\bstocks\b|\bgold\b|\bsilver\b|"
+                          r"\boil\b|\bbrent\b|\bcrude\b|\bbonds?\b|\bkospi\b|\bnikkei\b(?! (asia|reports?|says|reported))|hang seng|\bftse\b|market cap|"
+                          r"\bipo\b|\bshares\b|\betfs?\b|\bvix\b|bear market|bull market|\$[A-Z]{2,5}\b", re.I),
+    "bigco": re.compile(r"\bnvidia\b|\btesla\b|\bspacex\b|\bstarlink\b|\bapple\b|\bmeta\b|\bmicrosoft\b|\bamazon\b|"
+                        r"\bgoogle\b|\balphabet\b|\bjpmorgan\b|\bgoldman\b|bank of america|wells fargo|morgan stanley|"
+                        r"\bciti(group)?\b|\bvisa\b|\bmastercard\b|\bblackrock\b|\brobinhood\b|\bberkshire\b|\bnetflix\b|"
+                        r"\bopenai\b|\banthropic\b|\bxai\b|\bpaypal\b|\bschwab\b|\bfidelity\b|\bintel\b|\bamd\b|\btsmc\b|"
+                        r"\bboeing\b|\bsamsung\b|\bbroadcom\b|\boracle\b|\bpalantir\b|\bx\.com\b|\btwitter\b|\bgta\b", re.I),
+    "people": re.compile(r"\btrump\b|\bmusk\b|\bpowell\b|\bbessent\b|\bdimon\b|larry fink|\bbuffett\b|\bzuckerberg\b|"
+                         r"\baltman\b|jensen huang|\bxi( jinping)?\b|\bputin\b|\bzelensky[iy]?\b|\bnetanyahu\b|\bvance\b|"
+                         r"\bmilei\b|\bmodi\b|\bcz\b|changpeng zhao|\bsaylor\b|\bgensler\b|\batkins\b|\blutnick\b|"
+                         r"\bcathie wood\b|\bpeter schiff\b|\bbezos\b|\bcook\b(?=.{0,20}apple)", re.I),
+    "world": re.compile(r"\bchina\b|\bchinese\b|\brussia\b|\bukraine\b|\bisrael\b|\biran\b|\bgaza\b|\bhamas\b|\bhezbollah\b|"
+                        r"\beu\b|european union|\beurope\b|\buk\b|\bbritain\b|\bjapan\b|\bindia\b|north korea|\bsaudi\b|"
+                        r"\buae\b|\bdubai\b|\bvenezuela\b|\btaiwan\b|\bcanada\b|\bmexico\b|\bnato\b|\bg7\b|\bg20\b|"
+                        r"\bswitzerland\b|\bgermany\b|\bfrance\b|\bsouth korea\b|\bargentina\b|\bbrazil\b|\bturkey\b|"
+                        r"\bpentagon\b|\bwhite house\b|\bcongress\b|\bsenate\b|\bsupreme court\b|\bkremlin\b|"
+                        # 2026-10-26 world expansion
+                        r"\bserbia\b|\bserbian\b|\bbrazil(ian)?\b|\bargentin(a|e|ian)\b|\bmexic(o|an)\b|\bt(u|ü)rk(ey|iye|ish)\b|"
+                        r"\biranian\b|\bisraeli\b|\bukrainian\b|\brussian\b|\btaiwanese\b|\bindian\b|\bpakistan(i)?\b|"
+                        r"\bnorth korean\b|\bsaudi arabia\b|\bunited kingdom\b|\bbritish\b|\bfrench\b|\bgerman\b|"
+                        r"\bjapanese\b|\bvenezuelan\b|\buganda(n)?\b|\bkenya(n)?\b|\bnigeria(n)?\b|south africa(n)?\b|"
+                        r"\bethiopia(n)?\b|\bghana(ian)?\b|\btanzania(n)?\b|\brwanda(n)?\b|\begypt(ian)?\b|\bsyria(n)?\b|"
+                        r"\blebanon\b|\biraq(i)?\b|\byemen(i)?\b|\bafghanistan\b|\bpoland\b|\bpolish\b|\bhungary\b|"
+                        r"\bitaly\b|\bitalian\b|\bspain\b|\bspanish\b|\bnetherlands\b|\bdutch\b|\bcolombia(n)?\b|"
+                        r"\bchile(an)?\b|\bperu(vian)?\b|\bcuba(n)?\b|\bphilippines\b|\bindonesia(n)?\b|\bvietnam(ese)?\b|"
+                        r"\bthailand\b|\bmyanmar\b|\bbangladesh\b|\bsri lanka\b|\baustralia(n)?\b|\bnew zealand\b|"
+                        r"\bgeorgia\b(?! state)|\bmoldova\b|\bromania(n)?\b|\bbelarus\b|\bqatar\b|\bsudan\b|\bniger\b|"
+                        r"\bmali\b|\bdrc\b|\bcongo\b|\bsomalia\b|\bhaiti\b|\bbolivia\b|\becuador\b|\bunited nations\b|\bu\.?n\.? (security council|chief)\b", re.I),
+    # 2026-10-26: politics/leaders (elections, resignations, deaths of leaders)
+    "politics": re.compile(r"\belections?\b|\bpresiden(t|cy|tial)\b|prime minister|\bpremier\b|\b(ex-|former )?pm\b|\bchancellor\b|"
+                           r"\bparliament(ary)?\b|\breferendum\b|\brunoff\b|\bopposition leader\b|\bking\b|\bpope\b|\bmonarch\b|"
+                           r"\blula\b|\bvu(c|č)i(c|ć)\b|\bmuseveni\b|\bbobi wine\b|\bruto\b|\btinubu\b|\bramaphosa\b|\bstarmer\b|"
+                           r"\bmacron\b|\bmerz\b|\berdo(g|ğ)an\b|\bkhamenei\b|\bsheinbaum\b|\bmaduro\b|\bmachado\b|\btakaichi\b|"
+                           r"\bishiba\b|\bcarney\b|\balbanese\b|\bmeloni\b|\bsanchez\b|\borb(a|á)n\b|\bkim jong un\b|\bmbs\b|"
+                           r"\bpezeshkian\b|\bsharif\b|\bprabowo\b|\bmarcos\b|\bvon der leyen\b|\bguterres\b|\blee jae[- ]myung\b", re.I),
+    "crisis": re.compile(r"\bearthquake\b|\btsunami\b|\bcoup\b|\binvasion\b|\binvades?\b|\bceasefire\b|\bassassinat|"
+                         r"\bmartial law\b|state of emergency|\bhurricane\b|\btyphoon\b|\bcyclone\b|\bvolcan|\bnuclear\b|"
+                         r"\bterror(ist)? attack\b|\bmass shooting\b|\bplane crash\b|\bwar\b", re.I),
+}
+ENT_WEIGHT = {"crypto": 4, "macro": 4, "markets": 3, "bigco": 3, "people": 3, "politics": 3, "crisis": 3, "world": 2}
+
+NEWS_EVENT = re.compile(
+    r"\bannounc|\bsigns?\b|\bsigned\b|executive order|\bimpos|\bsanction|\bbans?\b|\bbanned\b|"
+    r"\bapprov|\brejects?\b|\blaunch(es|ed)?\b|\bunveil|\bcuts?\b|\bhikes?\b|\braises?\b|\bholds?\b(?= rates| interest)|"
+    r"record high|all[- ]time high|\brecord\b|\bcrash|\bplung|\btumbl|\bsoar|\bsurg|\bjumps?\b|\bdump|\bsinks?\b|\bslump|"
+    r"wiped|\bhalt|circuit breaker|\bbankrupt|\bdefault|\bacquir|\bmerger\b|\bbuys?\b|\bbought\b|\bsells?\b|\bsold\b|"
+    r"\bipo\b|\bearnings\b|\brevenue\b|\bbeats?\b|\bmiss(es)?\b|\blayoffs?\b|\bcuts? \d[\d,]* jobs|\bresign|\bsteps down\b|"
+    r"\bfired\b|\barrest|\bindict|\bcharged\b|\bsues?\b|\bsued\b|\blawsuit\b|\bruling\b|\brules\b|\bfined?\b|\bfines\b|"
+    r"\bceasefire\b|\battacks?\b|\bstrikes?\b|\bmissiles?\b|\binvad|\bemergency\b|\boutage\b|\bhack|\bexploit|"
+    r"\bliquidat|\bunlock|\breclaims?\b|\bfalls? (below|under)\b|\bdrops? (below|under)\b|\btops?\b|\bcrosses\b|\bhits?\b|"
+    r"\bwarns?\b|\bthreatens?\b|\bconfirms?\b|\bofficially\b|\bpasses\b|\bpassed\b|\bvotes?\b|\bdeal\b|\bagreement\b|"
+    r"\bpartners?\b|\bpartnership\b|\binvests?\b|\bdelist|\blists\b|\bfreez|\bseiz|\bdies\b|\bdead\b|\bkilled\b|"
+    r"\bshutdown\b|\bexpected\b|\bexpectations\b|\breports?\b|\bstatement\b|\bminutes\b|\bdecision\b|"
+    r"\burges?\b|\bstockpil|\borders?\b|\bto pay\b|\brolls? out\b|"
+    # 2026-10-26 world-politics events
+    r"\bconcedes?\b|\bconceded\b|\bdefeat(s|ed)?\b|\bwins?\b|\bwon\b|\bre-?elected\b|\belected\b|\bsworn in\b|"
+    r"\bdied\b|\bpasses away\b|\bimpeach|\bousted\b|\btopples?\b|\boverthrow|\bcoup\b|\bassassinat|"
+    r"\binvasion\b|\bearthquake\b|\btsunami\b|\bresults?\b|\blandslide\b|\bmajority\b|\bdetained\b|"
+    r"\bdeclares?\b|\bdissolves?\b|\bcalls? (snap|early) election", re.I)
+NEWS_BIG = re.compile(
+    r"\btrump\b.{0,50}\b(signs|announces|imposes|executive order|tariffs?|fires|pardons)|"
+    r"\b(fed|federal reserve|fomc|ecb|bank of japan|bank of england)\b.{0,40}\b(cuts|raises|hikes|holds|leaves)\b|"
+    r"rate (cut|hike)|emergency (rate|meeting)|"
+    r"\b(cpi|inflation|ppi|gdp|payrolls|jobs report|unemployment( rate)?|jobless claims|consumer price index|producer price index|retail sales)\b.{0,50}"
+    r"(\d|than expected|expectations|rises|falls|jumps|slows|accelerat)|"
+    r"wiped out|circuit breaker|record high|all[- ]time high|bear market|\bbankrupt|"
+    r"\b(stock market|s&p 500|nasdaq|dow|stocks|gold|silver|oil)\b.{0,40}\b(crash|plunge|tumble|surge|soar|record|dump|sinks?)|"
+    r"\b(declares?|launch(es)?|begins?|enters?) war\b|\bwar (begins|breaks out)\b|\binvasion\b|"
+    r"\bceasefire\b.{0,20}\b(agreed|reached|deal|signed|collapses|ends)\b|\bmissile strikes?\b|\bnuclear (test|strike|attack)\b|"
+    r"\b(earnings|revenue|eps)\b.{0,40}\b(beat|beats|beating|miss|misses|tops)|"
+    r"\b(acquire|buy|buys|merger|takeover)\b.{0,40}\$\s?\d+(\.\d+)?\s?(billion|bn|trillion)|"
+    r"\b(bitcoin|btc|ether|eth|solana|xrp)\b.{0,40}\b(etf|reserve|treasury|buys|bought|approv|falls (below|under)|reclaims|tops)|"
+    r"\b(hack|exploit|drain)\w*\b.{0,40}\$\s?\d|\$\s?\d[\d.,]*\s?(million|billion|m|bn)\b.{0,40}\b(liquidat|hack|stolen|drained)|"
+    r"\b(sec|cftc|congress|senate|white house|treasury)\b.{0,60}\b(crypto|stablecoin|bitcoin|digital asset)|"
+    r"\b(arrest|indict|charged)\w*\b.{0,40}\b(ceo|founder|president|minister)|"
+    r"\b(ceo|founder|chairman)\b.{0,30}\b(resigns|steps down|fired|ousted)|"
+    r"\b(buys|bought|acquires|acquired|adds|added)\b.{0,12}[\d,.]+\s?(k\s)?(bitcoin|btc|ether|eth|sol|xrp)\b|"
+    r"\b(visa|mastercard|jpmorgan|blackrock|schwab|paypal|fidelity|goldman|citi|bank)\b.{0,40}\b(launch\w*|rolls? out)\b.{0,40}\b(crypto|stablecoins?|bitcoin|tokeni\w*)|"
+    r"\b(surges?|soars?|plunges?|crash(es)?|tumbles?|jumps?|sinks?|drops?|falls?)\b.{0,15}\b(1\d|[2-9]\d)(\.\d+)?%|"
+    r"\b(judge|court)\b.{0,30}\b(orders|rules|blocks)\b|"
+    r"\bofficially\b|\bjust in\b|\bbreaking\b|"
+    # 2026-10-26 world-politics big events
+    r"\b(wins?|won|concedes?|conceded|loses|lost|claims victory in)\b.{0,40}\b(elections?|vote|presidency|presidential|runoff|referendum|term|majority|landslide)\b|"
+    r"\b(elections?|vote|runoff|presidency)\b.{0,40}\b(won|wins|concedes?|conceded|defeat|victory|results?)\b|"
+    r"\b(wins?|won|secures?|sworn in for|begins?|starts?) (a )?(second|third|fourth|fifth|sixth|seventh|eighth|new|another) (term|mandate)\b|"
+    r"\b(elected|re-?elected|sworn in)\b.{0,30}\b(president|prime minister|pm|chancellor|leader|pope)\b|"
+    r"\b(president|prime minister|pm|chancellor|king|queen|pope|leader|premier|minister)\b.{0,40}\b(dies|died|dead|resigns|resigned|steps down|ousted|impeached|assassinated|arrested|detained|killed)\b|"
+    r"\b(coup|assassinat\w*|impeach\w*|martial law|state of emergency)\b|"
+    r"\b(magnitude|m)\s?[6-9](\.\d)?\b.{0,30}\bearthquake\b|\bearthquake\b.{0,40}\b[6-9]\.\d\b|\btsunami (warning|alert|hits)\b|"
+    r"\binvasion of\b|\binvades?\b", re.I)
+NEWS_FLUFF = re.compile(
+    r"\bopinion\b|op-ed|\banalysis\b|\bcommentary\b|\bcolumn\b|\bexplainer\b|\bexplained\b|what to know|"
+    r"what we know|\btakeaways?\b|\bkey moments\b|\bwhat happened\b|\bhow to\b|\bhow (the|a|an|this|it)\b|^why\b|\bwhy (the|a|an|this|you|it|investors|stocks)\b|"
+    r"\bpodcast\b|\bnewsletter\b|^watch:|^video:|^live:|\blive updates?\b|\blive:|\bas it happened\b|week ahead|"
+    r"\bmorning (brief|briefing|bid)\b|\bevening briefing\b|\bstocks? to (buy|watch)\b|\bbest stocks\b|"
+    r"\bstocks making the biggest moves\b|\bthings to know\b|\b\d+ (things|ways|reasons|stocks)\b|\btop \d+\b|"
+    r"\bpersonal finance\b|\bretirement\b|\bmortgage rates? today\b|\bsavings? rates?\b|\bcd rates?\b|"
+    r"\bquiz\b|\bcrossword\b|\breview\b|\bhands[- ]on\b|\binterview\b|\bobituary\b|\bphotos?:|\bin pictures\b|"
+    r"\bsport|\bfootball\b|\bsoccer\b|\bnba\b|\bnfl\b|\bcricket\b|\btennis\b|\bmovie\b|\bcelebrity\b|"
+    r"\brecipe\b|\btravel\b|\bhoroscope\b|\bwordle\b|\bdeals? of the day\b|% off|\bcoupon\b|"
+    r"\bforecast\b|\bprice prediction\b|\boutlook\b|\bmocks?\b|\bslams?\b|\bblasts?\b|\brips\b|\bfears?\b|"
+    r"\bcould\b|\bmight\b|\bmay\b(?! \d)|\bpay off\b|\bwin for\b|\bheres?\b|\bhere's\b|\bsees\b|\bbets?\b", re.I)
+# Google News: only queue items from publishers we can verify against
+TRUSTED_PUBLISHERS = re.compile(
+    r"^(reuters|associated press|ap news|bloomberg|cnbc|the wall street journal|wsj|financial times|ft\.com|"
+    r"bbc|the new york times|nytimes|the washington post|axios|politico|the guardian|cnn|fox business|"
+    r"marketwatch|barron's|yahoo finance|fortune|business insider|the hill|nbc news|cbs news|abc news|"
+    r"al jazeera|nikkei asia|south china morning post|forbes|semafor|the economist|bloomberg law|"
+    r"coindesk|the block|decrypt|cointelegraph|dl news|bitcoin magazine|blockworks|the defiant|"
+    r"techcrunch|the verge|wired|ars technica|the information|engadget|cnet|zdnet|"
+    r"u\.s\. department of the treasury|treasury|bureau of labor statistics|bls|federal reserve|"
+    r"sec\.gov|ripple|the white house|whitehouse\.gov|anthropic|openai|x\.ai|google|venturebeat|"
+    r"investopedia|kiplinger|morningstar|investing\.com|fxstreet|kitco|deutsche welle|dw|france 24|"
+    r"times of india|the times|the telegraph|sky news|euronews|cbc|globe and mail|abc \(australia\))", re.I)
+OFFICIAL_RELEVANT = {
+    "Federal Reserve": re.compile(r"fomc|monetary policy|federal funds|discount rate|statement|minutes|"
+                                  r"crypto|stablecoin|digital asset|enforcement action|stress test|chair", re.I),
+    "SEC press releases": re.compile(r"crypto|bitcoin|ether|stablecoin|digital asset|token|etf|charges|"
+                                     r"chairman|atkins|fraud|ponzi", re.I),
+    "White House": re.compile(r"executive order|proclamation|tariff|sanction|fact sheet|announces|signs|"
+                              r"trade|deal|agreement|crypto|digital asset|ai\b|artificial intelligence|"
+                              r"economy|tax|energy|oil|china|russia|ukraine|israel|iran", re.I),
+    "GN: bls.gov": re.compile(r"consumer price index|producer price index|employment situation|"
+                              r"jobs|payroll|unemployment|cpi|ppi|inflation", re.I),
+    "GN: treasury.gov": re.compile(r"sanction|tariff|debt|refunding|buyback|stablecoin|genius|crypto|"
+                                   r"secretary|bessent|ofac", re.I),
+}
+TOPIC_ORDER = [("Crypto", "crypto"), ("Macro", "macro"), ("Markets", "markets"),
+               ("Tech", "bigco"), ("World", "politics"), ("World", "crisis"), ("World", "world"), ("World", "people")]
+
+
+def _clean_title(name: str, it: dict) -> str:
+    title, gsrc = it["title"], it.get("src", "")
+    if name.startswith("GN:"):
+        if gsrc and title.endswith(" - " + gsrc):
+            title = title[: -(len(gsrc) + 3)]
+        else:
+            title = re.sub(r"\s+-\s+[^-]{2,40}$", "", title)
+    return title.strip()
+
+
+def score_news(name: str, tier: str, it: dict, feed_topic: str) -> tuple[int, list[str], str, str]:
+    """General breaking-news scoring (markets, macro, crypto, big tech, world). Returns score, why, title, topic."""
+    title = _clean_title(name, it)
+    gsrc = it.get("src", "")
+    summary = it.get("summary", "")[:300]
+    why = []
+    if SPAM.search(f"{title} {gsrc} {it['link']}") or SPAM.search(summary[:200]) or AI_SPAM.search(f"{title} {gsrc}"):
+        return -99, ["spam/sponsored/low-trust"], title, ""
+    if NEWS_FLUFF.search(title):
+        return -50, ["fluff/opinion/explainer/live-blog"], title, ""
+    if CLICKBAIT.search(title) and not NEWS_BIG.search(title):
+        return -50, ["clickbait/prediction"], title, ""
+    if QUESTION_BAIT.search(title):
+        return -20, ["question headline"], title, ""
+    if name.startswith("GN:") and gsrc and not TRUSTED_PUBLISHERS.search(gsrc.strip()):
+        return -30, ["untrusted publisher:" + gsrc[:30]], title, ""
+    if name in OFFICIAL_RELEVANT and not OFFICIAL_RELEVANT[name].search(f"{title} {summary}"):
+        return -10, ["routine official release"], title, ""
+    groups = {g: (m.group(0) if (m := rx.search(title)) else None) for g, rx in ENT.items()}
+    groups = {g: m for g, m in groups.items() if m}
+    if feed_topic == "Crypto" and "crypto" not in groups and CRYPTO_TERM.search(summary):
+        groups["crypto"] = "(feed)"
+    s = 0
+    for i, g in enumerate(sorted(groups, key=lambda g: -ENT_WEIGHT[g])[:2]):
+        s += ENT_WEIGHT[g] if i == 0 else ENT_WEIGHT[g] // 2
+    if groups:
+        why.append("ent:" + ",".join(f"{g}={str(m).lower()[:14]}" for g, m in groups.items()))
+    ev = {m.group(0).lower() for m in NEWS_EVENT.finditer(title)}
+    if ev:
+        s += min(2, len(ev)) * 2; why.append("event:" + ",".join(sorted(ev))[:50])
+    big = NEWS_BIG.search(title)
+    if big:
+        s += 4; why.append("big:" + big.group(0).lower()[:30])
+    for m in MONEY.finditer(title):
+        v = float(m.group(1)) * (1000 if m.group(2).lower()[0] == "b" else 1)
+        if v >= 1000:
+            s += 2; why.append(f"${v/1000:.0f}B"); break
+    if re.search(r"\$\s?\d[\d.,]*\s?trillion|\btrillion\b", title, re.I):
+        s += 2; why.append("$T")
+    if re.search(r"\d+(\.\d+)?%", title):
+        s += 1; why.append("pct")
+    s += {"official": 3, "reputable": 1}.get(tier, -1)
+    # hard gates: needs a named entity AND an event
+    if not groups:
+        s = min(s, NEWS_HIT_THRESHOLD - 1); why.append("gate:no-entity")
+    if not (ev or big):
+        s = min(s, NEWS_HIT_THRESHOLD - 1); why.append("gate:no-event")
+    topic = next((t for t, g in TOPIC_ORDER if g in groups), feed_topic or "World")
+    if feed_topic == "Crypto" and "crypto" in groups:
+        topic = "Crypto"
+    return s, why, title, topic
+
+
+_NEWS_EVENT_STEMS = [("rates", r"rate|fomc|cuts|hikes|holds"), ("data", r"cpi|ppi|inflation|payroll|jobs|gdp|unemploy"),
+                     ("tariff", r"tariff|sanction|trade"), ("earnings", r"earnings|revenue|eps|quarter|q[1-4]"),
+                     ("move-up", r"surg|soar|jump|record|high|reclaim|tops|rall"),
+                     ("move-down", r"crash|plung|tumbl|dump|sink|slump|wiped|falls|drops|below|under"),
+                     ("deal", r"acqui|merger|buy|bought|deal|agreement|partner|invest"),
+                     ("legal", r"sue|lawsuit|charged|indict|arrest|fine|ruling|court|probe"),
+                     ("policy", r"executive order|signs|bill|law|approv|ban|vote|pass"),
+                     ("conflict", r"war|attack|strike|missile|ceasefire|invad"),
+                     ("hack", r"hack|exploit|drain|stolen|breach|outage"), ("people", r"resign|steps down|fired|ousted"),
+                     ("election", r"elect|concede|wins?\b|won\b|runoff|sworn in|term\b|vote"),
+                     ("death", r"dies|died|dead|killed|passes away|assassinat"), ("disaster", r"earthquake|tsunami|hurricane|typhoon")]
+
+
+def story_key(title: str) -> str | None:
+    """entity+event(+first number) key, so several outlets on one story within 3h give one hit."""
+    ents = []
+    for g in ("people", "politics", "bigco", "crypto", "macro", "markets", "crisis", "world"):
+        m = ENT[g].search(title)
+        if m:
+            ents.append(m.group(0).lower().strip())
+    if not ents:
+        return None
+    ev = next((n for n, rx in _NEWS_EVENT_STEMS if re.search(rx, title, re.I)), "other")
+    num = re.search(r"\d[\d,.]*\s?(%|billion|million|trillion|bn)?", title)
+    return "|".join(sorted(list(dict.fromkeys(ents))[:2])) + ":" + ev + (":" + num.group(0).replace(",", "").strip() if num else "")
+
+
+def kind_for(why: list[str], topic: str) -> str:
+    j = " ".join(why)
+    if "ai-security" in j:
+        return "ai-security"
+    if "big-event" in j or "big:" in j:
+        return "big-event"
+    if topic == "AI":
+        return "ai-top5-news" if "ai-top5" in j else "ai-news"
+    return topic.lower() + "-news"
+
+
+def score_ai(name: str, tier: str, it: dict) -> tuple[int, list[str], str]:
+    """AI scoring. Needs an AI company/model name AND a strong-event word; threshold AI_HIT_THRESHOLD."""
+    title = it["title"]
+    gsrc = it.get("src", "")
+    if name.startswith("GN:"):
+        if gsrc and title.endswith(" - " + gsrc):
+            title = title[: -(len(gsrc) + 3)]
+        else:
+            title = re.sub(r"\s+-\s+[^-]{2,40}$", "", title)
+    summary = it.get("summary", "")[:300]
+    text = f"{title} {summary}"
+    why = []
+    if (SPAM.search(f"{title} {gsrc} {it['link']}") or AI_SPAM.search(f"{title} {gsrc} {it['link']}")
+            or SPAM.search(summary[:200])):
+        return -99, ["spam/sponsored"], title
+    if AI_CLICKBAIT.search(title) or CLICKBAIT.search(title):
+        return -50, ["clickbait/explainer/review"], title
+    if QUESTION_BAIT.search(title):
+        return -20, ["question/bait headline"], title
+    if name in AI_REQUIRED and not AI_TERM.search(text):
+        return -10, ["non-AI item in general feed"], title
+    s = 0
+    top = [k for k, rx in AI_TOP5.items() if re.search(rx, title, re.I)]
+    if not top and name in AI_OFFICIAL_TOP5:
+        top = ["(official:" + name + ")"]
+    other = AI_OTHER.search(title)
+    generic = AI_SEC_GENERIC.search(title) if name in AI_SEC_FEEDS else None
+    if top:
+        s += 4; why.append("ai-top5:" + ",".join(top))
+    elif other:
+        s += 3; why.append("ai-other:" + other.group(0).lower()[:20])
+    elif generic:
+        s += 2; why.append("ai-generic:" + generic.group(0).lower()[:20])
+    elif any(re.search(rx, summary, re.I) for rx in AI_TOP5.values()) or AI_OTHER.search(summary):
+        s += 1; why.append("ai-name-body")
+    ev = set(m.group(0).lower() for m in AI_EVENT.finditer(title))
+    if ev:
+        s += min(2, len(ev)) * 2; why.append("ai-event:" + ",".join(sorted(ev))[:60])
+    mv = AI_MODEL_VER.search(title)
+    if mv:
+        s += 2; why.append("model:" + mv.group(0))
+    big = AI_BIG_EVENT.search(title)
+    if big:
+        s += 4; why.append("ai-big-event")
+    sec = AI_SEC_EVENT.search(title)
+    if sec:
+        s += 3; why.append("ai-security:" + sec.group(0).lower()[:20])
+        sev = AI_SEC_SEVERE.search(title)
+        if sev:
+            s += 2; why.append("severe:" + sev.group(0).lower()[:20])
+    for m in MONEY.finditer(title):
+        v = float(m.group(1)) * (1000 if m.group(2).lower()[0] == "b" else 1)
+        if v >= 1000 and re.search(r"rais|fund|valu|acqui|buy|deal|invest|ipo|fine|settle|contract", title, re.I):
+            s += 3; why.append(f"${v/1000:.0f}B")
+            break
+    if tier == "official":
+        s += 2; why.append("official")
+    elif tier == "reputable":
+        s += 1
+    else:
+        s -= 1
+    # hard gates: must be about a named AI player AND be an event
+    if not (top or other or (generic and sec)):
+        s = min(s, AI_HIT_THRESHOLD - 1); why.append("gate:no-ai-name")
+    if not (ev or mv or big or sec):
+        s = min(s, AI_HIT_THRESHOLD - 1); why.append("gate:no-event")
+    return s, why, title
+
+
+AI_STORY_DEDUPE_S = 12 * 3600
+_EVENT_STEMS = [("sue", r"\bsue|lawsuit|sued"), ("raise", r"rais|funding|valuation|valued|ipo"),
+                ("acquire", r"acqui|buys|merger"), ("outage", r"outage|down"), ("launch", r"launch|releas|unveil|introduc|debut|announc"),
+                ("ban", r"\bban|block|restrict"), ("regulate", r"regulat|fine|probe|investigat|antitrust|ai act|executive order"),
+                ("exec", r"resign|steps down|fired|ousted|hires"),
+                ("security", r"prompt[- ]injection|jailbr|flaw|vulnerab|exploit|leak|breach|malware|hijack|escape|"
+                             r"deepfake|backdoor|steal|stole|compromis")]
+
+def ai_story_key(why: list[str], title: str) -> str | None:
+    """company+event(+model) key, so 8 outlets covering one story within 12h give one hit."""
+    comp = [k for k, rx in AI_TOP5.items() if re.search(rx, title, re.I)]
+    o = AI_OTHER.search(title)
+    if not comp and o:
+        comp = [o.group(0).lower().split()[0]]
+    if not comp:
+        g = AI_SEC_GENERIC.search(title)
+        if g and AI_SEC_EVENT.search(title):
+            comp = ["generic-" + g.group(0).lower().split()[-1]]
+    if not comp:
+        return None
+    ev = next((n for n, rx in _EVENT_STEMS if re.search(rx, title, re.I)), "other")
+    mv = AI_MODEL_VER.search(title)
+    return f"{comp[0]}:{ev}" + (f":{mv.group(0).lower()}" if mv else "")
+
+# ------------------------------------------------------------------ prices
+CRYPTO_ASSETS = {"btc": "bitcoin", "eth": "ethereum", "sol": "solana", "xrp": "ripple"}
+CRYPTO_NAMES = {"btc": "Bitcoin $BTC", "eth": "Ethereum $ETH", "sol": "Solana $SOL", "xrp": "$XRP"}
+# Yahoo Finance chart API (free, no key; checked 2026-10-25). Futures trade ~23h on weekdays.
+MARKET_ASSETS = {"gold": ("GC=F", "Gold"), "spx": ("ES=F", "S&P 500 futures"),
+                 "ndx": ("NQ=F", "Nasdaq 100 futures"), "oil": ("CL=F", "WTI crude oil")}
+# thresholds: (1h move %, move vs previous close %)
+MOVE_PCT = {"btc": (3.0, 5.0), "eth": (3.0, 6.0), "sol": (3.0, 7.0), "xrp": (3.0, 7.0),
+            "gold": (1.5, 2.5), "spx": (1.2, 2.0), "ndx": (1.5, 2.5), "oil": (3.0, 5.0)}
+# round-number levels Watcher Guru-style ("Bitcoin falls under $80,000", "$2,500 $ETH")
+LEVEL_STEP = {"btc": 2500, "eth": 100, "sol": 10, "xrp": 0.10, "gold": 100}
+CRYPTO_POLL_S = 60
+MARKET_POLL_S = 120
+COOLDOWN_1H_S = 90 * 60
+COOLDOWN_DAY_S = 6 * 3600
+COOLDOWN_LEVEL_S = 6 * 3600
+LEVEL_HYST = 0.003                  # 0.3% band around a level to avoid flapping
+
+
+def _fmt_price(p: float) -> str:
+    return f"${p:,.0f}" if p >= 100 else (f"${p:,.2f}" if p >= 1 else f"${p:,.4f}")
+
+
+def _price_alerts(st: dict, cur: dict, daych: dict, topic: str, names: dict, urls: dict) -> list[dict]:
+    t = now_ts()
+    hist = st.setdefault("price_hist2", [])
+    cd = st.setdefault("cooldowns", {})
+    prev = next((h for h in reversed(hist) if any(k in h["p"] for k in cur)), None)
+    hits = []
+
+    def fire(key, cool, title, sym, pct=None, score=10):
+        if t - cd.get(key, 0) < cool:
+            return
+        cd[key] = t
+        hits.append({"kind": "price", "topic": topic, "title": title, "asset": sym, "pct": pct,
+                     "url": urls[sym], "source": "CoinGecko" if topic == "Crypto" else "Yahoo Finance",
+                     "score": score, "published_ts": t, "published_eat": eat(t), "age_min": 0})
+
+    for sym, p in cur.items():
+        m1, md = MOVE_PCT[sym]
+        old = [h for h in hist if 45 * 60 <= t - h["t"] <= 75 * 60 and sym in h["p"]]
+        if old:
+            ref = min(old, key=lambda h: abs(t - h["t"] - 3600))["p"][sym]
+            pct = (p / ref - 1) * 100
+            if abs(pct) >= m1:
+                d = "up" if pct > 0 else "down"
+                fire(f"1h:{sym}:{d}", COOLDOWN_1H_S,
+                     f"{names[sym]} {'surges' if pct > 0 else 'drops'} {abs(pct):.1f}% in the past hour to {_fmt_price(p)}",
+                     sym, round(pct, 2), 11)
+        c = daych.get(sym)
+        if c is not None and abs(c) >= md:
+            d = "up" if c > 0 else "down"
+            fire(f"day:{sym}:{d}", COOLDOWN_DAY_S,
+                 f"{names[sym]} {'up' if c > 0 else 'down'} {abs(c):.1f}% {'in 24h' if topic == 'Crypto' else 'on the day'}, now {_fmt_price(p)}",
+                 sym, round(c, 2), 9)
+        step = LEVEL_STEP.get(sym)
+        if step and prev and sym in prev["p"]:
+            q = prev["p"][sym]
+            lo, hi = sorted((q, p))
+            k = int(lo // step) + 1
+            while k * step <= hi:
+                lv = round(k * step, 6)
+                up = q < lv and p >= lv * (1 + LEVEL_HYST)
+                dn = q > lv and p <= lv * (1 - LEVEL_HYST)
+                if up or dn:
+                    word = "reclaims" if up else "falls under"
+                    fire(f"lvl:{sym}:{lv}", COOLDOWN_LEVEL_S, f"{names[sym]} {word} {_fmt_price(lv)}", sym, score=9)
+                k += 1
+    return hits
+
+
+def check_crypto_prices(st: dict) -> list[dict]:
+    ids = ",".join(CRYPTO_ASSETS.values())
+    code, body, _ = http_get(f"https://api.coingecko.com/api/v3/simple/price?ids={ids}&vs_currencies=usd"
+                             f"&include_24hr_change=true")
+    if code != 200:
+        raise RuntimeError(f"CoinGecko HTTP {code}")
+    data = json.loads(body)
+    cur = {s: float(data[c]["usd"]) for s, c in CRYPTO_ASSETS.items() if c in data}
+    ch = {s: float(data[c].get("usd_24h_change") or 0) for s, c in CRYPTO_ASSETS.items() if c in data}
+    urls = {s: f"https://www.coingecko.com/en/coins/{c}" for s, c in CRYPTO_ASSETS.items()}
+    hits = _price_alerts(st, cur, ch, "Crypto", CRYPTO_NAMES, urls)
+    _record(st, cur, ch)
+    return hits
+
+
+def check_market_prices(st: dict) -> list[dict]:
+    cur, ch, urls, names = {}, {}, {}, {}
+    for sym, (tick, nm) in MARKET_ASSETS.items():
+        q = urllib.parse.quote(tick)
+        code, body, _ = http_get(f"https://query1.finance.yahoo.com/v8/finance/chart/{q}?interval=5m&range=1d")
+        if code != 200:
+            log.warning("Yahoo %s HTTP %s", tick, code)
+            continue
+        m = json.loads(body)["chart"]["result"][0]["meta"]
+        p, pc, mt = m.get("regularMarketPrice"), m.get("chartPreviousClose") or m.get("previousClose"), m.get("regularMarketTime")
+        if not p or not mt or now_ts() - mt > 20 * 60:      # market closed / stale quote: no alerts
+            continue
+        cur[sym] = float(p)
+        if pc:
+            ch[sym] = (float(p) / float(pc) - 1) * 100
+        urls[sym] = f"https://finance.yahoo.com/quote/{q}"
+        names[sym] = nm
+    if not cur:
+        return []
+    hits = _price_alerts(st, cur, ch, "Markets", names, urls)
+    _record(st, cur, ch)
+    return hits
+
+
+def _record(st: dict, cur: dict, ch: dict):
+    t = now_ts()
+    hist = st.setdefault("price_hist2", [])
+    hist.append({"t": t, "p": cur})
+    st["price_hist2"] = [h for h in hist if t - h["t"] <= 3 * 3600]
+    lp = st.get("last_prices")
+    if not isinstance(lp, dict) or "t" in lp:          # old (AI-only era) format
+        lp = st["last_prices"] = {}
+    for s, p in cur.items():
+        lp[s] = {"t": t, "eat": eat(t), "p": p, "ch": round(ch.get(s, 0), 2)}
+
+# ------------------------------------------------------------------ escalation
+# ------------------------------------------------------------------ escalation
+def load_webhook_cfg() -> dict:
+    cfg = {}
+    if os.path.exists(WEBHOOK_ENV):
+        with open(WEBHOOK_ENV) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                cfg[k.strip().removeprefix("export ").strip()] = v.strip().strip('"').strip("'")
+    for k in ("HERALD_WEBHOOK_URL", "HERALD_WEBHOOK_KEY", "HERALD_WEBHOOK_AUTH_HEADER",
+              "HERALD_WEBHOOK_AUTH_SCHEME"):
+        if os.environ.get(k) and not cfg.get(k):
+            cfg[k] = os.environ[k]
+    return cfg
+
+def post_webhook(cfg: dict, payload: dict) -> bool:
+    url, key = cfg["HERALD_WEBHOOK_URL"], cfg.get("HERALD_WEBHOOK_KEY", "")
+    mode = (cfg.get("HERALD_WEBHOOK_AUTH_HEADER") or "both").strip()
+    scheme = cfg.get("HERALD_WEBHOOK_AUTH_SCHEME", "Bearer")
+    headers = {"Content-Type": "application/json", "User-Agent": UA}
+    if key:
+        if mode.lower() == "both":
+            headers["Authorization"] = f"{scheme} {key}".strip()
+            headers["X-Webhook-Key"] = key
+        elif mode.lower() == "authorization":
+            headers["Authorization"] = f"{scheme} {key}".strip()
+        else:
+            headers[mode] = key
+    req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
+            log.info("webhook POST -> %s", r.status)
+            return 200 <= r.status < 300
+    except urllib.error.HTTPError as e:
+        log.warning("webhook HTTP %s: %s", e.code, e.read(300))
+    except Exception as e:
+        log.warning("webhook error: %s", e)
+    return False
+
+def maybe_escalate(st: dict, dry: bool):
+    pend = st.setdefault("pending_escalation", [])
+    t = now_ts()
+    # breaking only: drop anything published more than MAX_AGE_MIN ago (it's still in the queue file)
+    pend[:] = [h for h in pend if (t - h.get("published_ts", t)) / 60 <= MAX_AGE_MIN]
+    if not pend:
+        return
+    cfg = load_webhook_cfg()
+    if not cfg.get("HERALD_WEBHOOK_URL"):
+        if not st.get("_warned_no_webhook_day") == dt.date.today().isoformat():
+            log.info("escalation disabled (no HERALD_WEBHOOK_URL in %s or env); %d hit(s) queued only",
+                     WEBHOOK_ENV, len(pend))
+            st["_warned_no_webhook_day"] = dt.date.today().isoformat()
+        st["pending_escalation"] = []
+        return
+    day = dt.datetime.now(TZ).date().isoformat()
+    esc = st.setdefault("escalations", {"day": day, "count": 0, "last": 0})
+    if esc.get("day") != day:
+        esc.update(day=day, count=0)
+    if esc["count"] >= ESC_MAX_PER_DAY:
+        return
+    gap = t - esc.get("last", 0)
+    fast = [h for h in pend if h.get("priority") and h.get("score", 0) >= FAST_LANE_MIN_SCORE]
+    fast_lane = bool(fast) and gap < ESC_MIN_GAP_S
+    if gap < ESC_MIN_GAP_S and not (fast and gap >= FAST_LANE_MIN_GAP_S):
+        return
+    # priority hits first, then by score
+    ranked = sorted(pend, key=lambda h: (not h.get("priority"), -h.get("score", 0), -h.get("published_ts", 0)))
+    send, n_ai = [], 0
+    for h in ranked:
+        if h.get("topic") == "AI":
+            if n_ai >= AI_MAX_HITS_PER_POST:
+                continue
+            n_ai += 1
+        send.append(h)
+        if len(send) >= MAX_HITS_PER_WEBHOOK:
+            break
+    payload = {
+        "event": "herald_breaking_news",
+        "account": "@JhMpologoma",
+        "ts_eat": eat(t),
+        "count": len(send),
+        "priority": any(h.get("priority") for h in send),
+        "fast_lane": fast_lane,
+        "instance": INSTANCE,
+        "topics": sorted({h.get("topic", "?") for h in send}),
+        "hits": send,
+        "queue_file": QUEUE_PATH,
+        "mode": "breaking-news (markets, macro, crypto, AI, tech, world)",
+        "instructions": "Verify each hit at the official or a reputable source before posting (never post from "
+                        "another account's post alone). Write in our own words, Watcher-Guru-style 'JUST IN:' format "
+                        "per ../watcher-guru-style.md. Mark handled in breaking-queue.jsonl.",
+    }
+    if dry:
+        log.info("[dry-run] would escalate %d hit(s) (topics %s)%s", len(send), payload["topics"], " FAST-LANE" if fast_lane else "")
+        return
+    if post_webhook(cfg, payload):
+        esc["count"] += 1
+        esc["last"] = t
+        sent = {id(h) for h in send}
+        # unsent lower-ranked hits stay pending for the next window while still fresh
+        st["pending_escalation"] = [h for h in pend if id(h) not in sent]
+        log.info("escalated %d hit(s) [%s]%s; %d still pending; %d/%d today",
+                 len(send), ",".join(payload["topics"]), " FAST-LANE" if fast_lane else "",
+                 len(st["pending_escalation"]), esc["count"], ESC_MAX_PER_DAY)
+    else:
+        esc["last"] = t - ESC_MIN_GAP_S + 120   # retry in ~2 min
+
+
+# ------------------------------------------------------------------ cycle
+UNDATED_FEEDS = {"Nikkei Asia"}
+
+
+def is_fast_lane(name: str, it: dict, score: int) -> bool:
+    if score < FAST_LANE_MIN_SCORE:
+        return False
+    src = (it.get("src") or "").strip()
+    if name.startswith("GN:"):
+        # aggregator results only count when the publisher itself is a top wire / official source
+        if src:
+            return bool(FAST_LANE_PUBLISHERS.search(src))
+    elif FAST_LANE_FEEDS.search(name):
+        return True
+    try:
+        host = urllib.parse.urlsplit(it.get("link", "")).netloc.lower().split(":")[0]
+    except Exception:
+        host = ""
+    return bool(FAST_LANE_DOMAINS.search(host))
+
+
+def poll_feed(name: str, url: str, tier: str, topic: str, st: dict, t: float, first_run: bool, dry: bool) -> list[dict]:
+    seen = st.setdefault("seen_urls", {})
+    recent = st.setdefault("recent_hits", [])
+    health = st.setdefault("feed_health", {})
+    try:
+        items = fetch_feed(name, url, st)
+        prev = health.get(name, {})
+        health[name] = {"ok": True, "t": t, "n": len(items) if items else prev.get("n", 0)}
+    except Exception as e:
+        health[name] = {"ok": False, "t": t, "err": str(e)[:120]}
+        log.warning("feed %s failed: %s", name, e)
+        return []
+    hits = []
+    primed = st.setdefault("primed_feeds", {})
+    was_primed = bool(primed.get(name))
+    if items:
+        primed[name] = t
+    for it in items:
+        if not it["link"]:
+            continue
+        nu = norm_url(it["link"])
+        if nu in seen:
+            continue
+        seen[nu] = t
+        if not it["date"]:
+            if name in UNDATED_FEEDS and was_primed:
+                it["date"] = t          # first time we see it after the feed was primed = (near) publish time
+            else:
+                continue
+        age_min = (t - it["date"]) / 60
+        if age_min > MAX_AGE_MIN or age_min < -30:
+            continue
+        if first_run and age_min > FIRST_RUN_MAX_AGE_MIN and not dry:
+            continue
+        if topic == "AI":
+            sc, why, clean = score_ai(name, tier, it)
+            item_topic, thr = "AI", AI_HIT_THRESHOLD
+        else:
+            sc, why, clean, item_topic = score_news(name, tier, it, topic)
+            thr = CRYPTO_HIT_THRESHOLD if item_topic == "Crypto" else NEWS_HIT_THRESHOLD
+        if sc < thr:
+            continue
+        if item_topic == "AI":
+            skey, win, stories = ai_story_key(why, clean), AI_STORY_DEDUPE_S, st.setdefault("ai_stories", {})
+        else:
+            skey, win, stories = story_key(clean), STORY_DEDUPE_S, st.setdefault("stories", {})
+        if skey and t - stories.get(skey, 0) < win:
+            continue
+        toks = title_tokens(clean)
+        dup = next((r for r in recent if similar(toks, set(r["tokens"])) >= 0.5), None)
+        if dup:
+            dup.setdefault("also", []).append(name)
+            continue
+        recent.append({"t": t, "tokens": sorted(toks), "title": clean})
+        if skey:
+            stories[skey] = t
+        hits.append({
+            "ts_eat": eat(t), "topic": item_topic,
+            "source": name + (f" ({it['src']})" if it.get("src") else ""),
+            "title": clean, "url": it["link"], "score": sc, "kind": kind_for(why, item_topic),
+            "why": why, "published_eat": eat(it["date"]), "published_ts": it["date"], "age_min": round(age_min),
+            "detect_lag_s": round(t - it["date"]), "handled": False,
+            "priority": is_fast_lane(name, it, sc), "instance": INSTANCE,
+        })
+    return hits
+
+
+def cycle(st: dict, dry: bool, force_all: bool = False) -> list[dict]:
+    """Poll every feed whose interval has elapsed (all of them if force_all)."""
+    t = now_ts()
+    first_run = not st.get("seen_urls")
+    last_fetch = st.setdefault("feed_last_fetch", {})
+    hits, polled = [], 0
+    for name, url, tier, interval in FEEDS:
+        if not force_all and t - last_fetch.get(name, 0) < interval:
+            continue
+        last_fetch[name] = t
+        topic = "AI" if name in AI_FEED_NAMES else ("Crypto" if name in CRYPTO_FEED_NAMES else "")
+        hits += poll_feed(name, url, tier, topic, st, t, first_run, dry)
+        polled += 1
+        if _stop:
+            break
+    if PRICE_ALERTS_ENABLED:
+        for key, every, fn in (("_crypto_px", CRYPTO_POLL_S, check_crypto_prices),
+                               ("_market_px", MARKET_POLL_S, check_market_prices)):
+            if force_all or t - last_fetch.get(key, 0) >= every:
+                last_fetch[key] = t
+                try:
+                    for h in fn(st):
+                        h.update(ts_eat=eat(t), handled=False)
+                        hits.append(h)
+                except Exception as e:
+                    log.warning("price check %s failed: %s", key, e)
+
+    # prune state
+    st["seen_urls"] = {u: ts for u, ts in st.get("seen_urls", {}).items() if t - ts < 4 * 86400}
+    st["recent_hits"] = [r for r in st.get("recent_hits", []) if t - r["t"] < 48 * 3600]
+    st["ai_stories"] = {k: v for k, v in st.get("ai_stories", {}).items() if t - v < AI_STORY_DEDUPE_S}
+    st["stories"] = {k: v for k, v in st.get("stories", {}).items() if t - v < STORY_DEDUPE_S}
+    st.pop("price_hist", None)
+
+    if hits and not dry:
+        with open(QUEUE_PATH, "a") as f:
+            for h in hits:
+                f.write(json.dumps(h, ensure_ascii=False) + "\n")
+        st.setdefault("pending_escalation", []).extend(hits)
+    for h in hits:
+        log.info("HIT [%s %s %s] %s | %s | lag %ss | %s", h.get("topic"), h["kind"], h["score"], h["title"],
+                 h["source"], h.get("detect_lag_s", 0), h["url"])
+    maybe_escalate(st, dry)
+    if polled or hits:
+        st["last_cycle"] = {"t": t, "eat": eat(t), "feeds_polled": polled, "hits": len(hits)}
+    return hits
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--once", action="store_true")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("-v", "--verbose", action="store_true")
+    ap.add_argument("--max-age-min", type=float, help="override freshness window (testing)")
+    ap.add_argument("--prime", action="store_true",
+                    help="one pass that only marks every current item as seen (sends nothing); for a fresh state file")
+    a = ap.parse_args()
+    global MAX_AGE_MIN, PRICE_ALERTS_ENABLED
+    if a.max_age_min:
+        MAX_AGE_MIN = a.max_age_min
+    if a.prime:
+        a.once, MAX_AGE_MIN, PRICE_ALERTS_ENABLED = True, -1, False
+    setup_logging(a.verbose or (a.once and not a.dry_run))
+
+    def _sig(*_):
+        global _stop
+        _stop = True
+    signal.signal(signal.SIGTERM, _sig)
+    signal.signal(signal.SIGINT, _sig)
+
+    log.info("watcher start (once=%s dry=%s) pid=%s feeds=%d (news %d, crypto %d, AI %d) prices=%s "
+             "webhook: 1/%dmin, %d/day, %d hits/batch, max age %dmin",
+             a.once, a.dry_run, os.getpid(), len(FEEDS), len(NEWS_FEEDS) if NEWS_ENABLED else 0,
+             len(CRYPTO_FEEDS) if CRYPTO_ENABLED else 0, len(AI_FEEDS4), PRICE_ALERTS_ENABLED,
+             ESC_MIN_GAP_S // 60, ESC_MAX_PER_DAY, MAX_HITS_PER_WEBHOOK, MAX_AGE_MIN)
+    st = load_state()
+    if a.dry_run:
+        for k in ("seen_urls", "recent_hits", "http_cache", "stories", "ai_stories", "feed_last_fetch"):
+            st[k] = {} if k != "recent_hits" else []
+    n_cycles = 0
+    while True:
+        try:
+            hits = cycle(st, a.dry_run, force_all=a.once)
+            lc = st.get("last_cycle", {})
+            n_cycles += 1
+            if hits or n_cycles % 20 == 0:      # summary every ~5 min, or when something hit
+                ok = sum(1 for v in st.get("feed_health", {}).values() if v.get("ok"))
+                log.info("tick: %d hit(s) | feeds ok %d/%d | last poll %s", len(hits), ok,
+                         len(st.get("feed_health", {})), lc.get("eat"))
+        except Exception as e:
+            log.exception("cycle crashed: %s", e)
+            hits = []
+        if not a.dry_run:
+            save_state(st)
+        if a.once:
+            if a.dry_run:
+                print(json.dumps(hits, indent=1, ensure_ascii=False))
+            return
+        end = time.time() + TICK_SECONDS
+        while time.time() < end and not _stop:
+            time.sleep(1)
+        if _stop:
+            log.info("watcher stop")
+            if not a.dry_run:
+                save_state(st)
+            return
+
+
+if __name__ == "__main__":
+    main()

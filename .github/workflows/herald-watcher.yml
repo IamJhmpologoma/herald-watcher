@@ -1,0 +1,48 @@
+# Always-on copy of the Herald breaking-news watcher (@JhMpologoma). Public repo; secrets live in Actions secrets only.
+# Secrets: HERALD_WEBHOOK_URL, HERALD_WEBHOOK_KEY (set with `gh secret set ... < file`, never echoed).
+name: herald-watcher
+on:
+  schedule:
+    - cron: "*/5 * * * *"      # GitHub's minimum; real start times drift 5-15 min under load
+  workflow_dispatch: {}
+concurrency:
+  group: herald-watcher
+  cancel-in-progress: false
+permissions:
+  contents: read
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    env:
+      HERALD_INSTANCE: gha
+      HERALD_STATE_PATH: ${{ github.workspace }}/state/state.json
+      HERALD_QUEUE_PATH: ${{ github.workspace }}/state/breaking-queue.jsonl
+      HERALD_LOG_PATH: ${{ github.workspace }}/state/watcher.log
+      HERALD_WEBHOOK_ENV: /dev/null
+      HERALD_WEBHOOK_URL: ${{ secrets.HERALD_WEBHOOK_URL }}
+      HERALD_WEBHOOK_KEY: ${{ secrets.HERALD_WEBHOOK_KEY }}
+      HERALD_WEBHOOK_AUTH_HEADER: both
+      HERALD_WEBHOOK_AUTH_SCHEME: Bearer
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: Restore state (seen items, stories, escalation counters)
+        uses: actions/cache/restore@v4
+        with:
+          path: state
+          key: herald-state-${{ github.run_id }}
+          restore-keys: herald-state-
+      - name: Poll once
+        run: |
+          mkdir -p state
+          if [ ! -f state/state.json ]; then python watcher.py --prime; fi   # first run: mark current items seen, send nothing
+          python watcher.py --once
+          tail -n 20 state/watcher.log | grep -v -i "webhook POST" || true
+      - name: Save state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state
+          key: herald-state-${{ github.run_id }}
