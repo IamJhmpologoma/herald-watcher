@@ -195,6 +195,81 @@ AI_FEED_INTERVAL = {"OpenAI news": 9 * 60, "Mistral AI news": 6 * 60, "Google De
 AI_FEEDS4 = [(n, u, t, AI_FEED_INTERVAL.get(n, 180)) for n, u, t in AI_FEEDS]
 
 FEEDS = ((NEWS_FEEDS if NEWS_ENABLED else []) + (CRYPTO_FEEDS if CRYPTO_ENABLED else []) + AI_FEEDS4)
+
+# ---- FinancialJuice (added 2026-10-26 at Jjuko's request): LEADS ONLY, headline-worthy items only.
+# Public RSS (curl-checked 2026-10-26 ~14:20 EAT: HTTP 200, 100 items, fresh within minutes, no ETag).
+# FJ is a very noisy squawk: data prints, speaker soundbites, "sources" chatter, vol/probability tables.
+# score_fj() drops routine items, needs an FJ_MAJOR signal AND score >= FJ_MIN_SCORE (normal news min is 9).
+# Never cite FinancialJuice: each hit carries lead_only/verify_note; confirm at the primary source first.
+# Not fast-lane unless the line is attributed to a top wire (Reuters/Bloomberg/AP/...) and scores high.
+FJ_NAME = "FinancialJuice"
+FJ_URL = "https://www.financialjuice.com/feed.ashx?xy=rss"
+FJ_POLL_S = 75
+FJ_MIN_SCORE = 12
+FJ_FEEDS = [(FJ_NAME, FJ_URL, "aggregator", FJ_POLL_S)] if os.environ.get("HERALD_FJ", "1") == "1" else []
+FEEDS = FEEDS + FJ_FEEDS
+PRIME_ON_FIRST_FETCH = {FJ_NAME}        # new feed: first fetch only marks items seen (no backlog burst)
+FJ_PREFIX = re.compile(r"^\s*financialjuice:\s*", re.I)
+# routine noise: always dropped
+FJ_NOISE = re.compile(
+    r"fjelite|interest rate probabilities|implied volatility|correlation matrix|currency strength|"
+    r"\bcot\b|positioning|options? expir|\bfx options\b|\bpoll:|\bpoll shows\b|\bsurvey\b(?!.*\b(record|crash)\b)|"
+    r"target price|price target|\b(upgrades?|downgrades?|raises|cuts|lowers) (to|target)|overweight|underweight|equal-weight|"
+    r"\bwatch ?list\b|\bestimate\b|midpoint|reverse repos?|\binjects?\b|\bliquidity operation|\bauction\b|"
+    r"\bsells? \d+-day\b|stabilisation bonds|\bfutures (rise|fall|edge|gain|slip)\b|early (asian )?trad|"
+    r"\b(rises?|falls?|edges?|gains?|slips?|dips?|up|down) \d(\.\d+)?%(?! in a day)|"
+    r"\bwhat to expect\b|\bpreview\b|\breview\b|\bsentiment\b|\bcalendar\b|\bexpected to\b|\bexpects?\b|\bhopes?\b|"
+    r"\bsources?\b|\bsource says\b|\bpeople familiar\b|\breportedly\b|\brumou?r|\bunconfirmed\b|"
+    r"files (mixed )?(securities )?shelf|\b(q[1-4]|fy) \d{4} earnings$|^\$?[a-z]{1,5} .{0,40} earnings$|"
+    r"no immediate (\w+ )?confirmation|\bintercept\w*|\btargeted\b|\bclaims? responsibility\b|\bwe will not\b|\bnot proposing\b|\bseeks public feedback\b|\bconsidering\b|\bplans? to compile\b", re.I)
+# a "Speaker: quote" line. Kept only if the quote itself is a FJ_MAJOR event.
+FJ_SPEAKER = re.compile(r"^[^:]{2,70}:\s+\S")
+# economic data prints: "<Indicator> Actual A (Forecast F, Previous P)"
+FJ_DATA = re.compile(r"^(?P<ind>.+?)\s+actual\s+(?P<a>-?[\d.,]+)\s*(?P<u>%|k|m|b)?\s*\(forecast\s+(?P<f>-?[\d.,]+|-)\s*(%|k|m|b)?", re.I)
+# only these prints can ever pass, and only with a big surprise vs forecast (abs difference)
+FJ_DATA_MAJOR = [
+    (re.compile(r"^(us )?(fed|fomc).{0,30}(interest )?rate decision", re.I), 0.0),     # any Fed decision
+    (re.compile(r"^(ecb|boe|boj|bank of (england|japan)).{0,30}rate decision", re.I), 0.0),
+    (re.compile(r"^(us )?non-?farm payrolls", re.I), 75.0),                             # thousands
+    (re.compile(r"^(us )?(core )?cpi (yoy|y/y|mom|m/m)", re.I), 0.2),
+    (re.compile(r"^(us )?unemployment rate", re.I), 0.2),
+    (re.compile(r"^(us )?(gdp|gdp growth rate).{0,20}(qoq|annuali[sz]ed|advance)", re.I), 1.0),
+]
+# headline-worthy signal required for every non-data FJ item
+FJ_MAJOR = re.compile(
+    # central-bank decisions / emergency action
+    r"\b(fed|fomc|federal reserve|ecb|boe|boj|bank of (england|japan)|pboc|snb)\b.{0,40}\b(cuts?|raises?|hikes?|holds?|leaves|keeps|unexpectedly)\b.{0,30}\b(rates?|basis points|bps|bp)\b|"
+    r"\bemergency (rate|meeting|cut)\b|\bintervene[sd]? in (the )?(fx|currency|yen)|\bintervention\b|"
+    # big market moves
+    r"\bcircuit breaker|\btrading (halted|suspended)\b|\bflash crash\b|"
+    r"\b(s&p 500|nasdaq|dow|stocks|gold|silver|oil|brent|wti|bitcoin|btc|yen|dollar|yuan|treasury yields?)\b.{0,40}\b(record high|all[- ]time high|crash\w*|plunges?|plummets?|soars?|biggest (drop|fall|gain|rise))\b|"
+    r"\b(1\d|[2-9]\d)(\.\d+)?% in a day\b|"
+    # war / geopolitical shock
+    r"\bdeclares? war\b|\binva(des?|sion)\b|\bnuclear (test|strike|attack|weapon)\b|\bmartial law\b|\bcoup\b|\bassassinat|"
+    r"\bstate of emergency\b|\bceasefire\b.{0,30}\b(agreed|reached|signed|collapses|ends|announced)\b|"
+    r"\b(attacks?|strikes?|missiles?|drones?|bomb\w*|explosions?)\b.{0,50}\b(riyadh|tehran|tel aviv|jerusalem|taipei|beijing|washington|seoul|abu dhabi|dubai|doha|pyongyang)\b|"
+    r"\b(strikes?|attacks?)\b.{0,30}\bnuclear (plant|site|facilit\w*)\b|"
+    r"\bstrait of hormuz\b.{0,40}\b(closed?|clos(es|ing)|block\w*|mine\w*)\b|"
+    # leaders
+    r"\b(president|prime minister|pm|chancellor|king|queen|pope|supreme leader|crown prince)\b.{0,40}\b(dies|died|dead|resigns|resigned|steps down|ousted|impeached|assassinated|arrested|killed)\b|"
+    r"\b(dies|died) at \d+\b.{0,0}|"
+    r"\b(wins?|won|concedes?)\b.{0,30}\b(election|presidency|runoff|referendum)\b|\bcalls? (snap|early) election\b|"
+    # big company / government announcements
+    r"\b(acquire|acquires|acquisition|merger|takeover|buy|buys|to buy|offer|stock sale|stake|invest\w*|deal|bid)\b.{0,60}\$\s?(1\d|[2-9]\d|\d{3,})(\.\d+)?\s?(b|bn|billion)\b|"
+    r"\$\s?(1\d|[2-9]\d|\d{3,})(\.\d+)?\s?(b|bn|billion)\b.{0,60}\b(acquire|acquisition|merger|takeover|stock sale|offering|deal|bid)\b|"
+    r"\$\s?\d+(\.\d+)?\s?(t|tn|trillion)\b|"
+    r"\b(bankrupt\w*|chapter 11|defaults? on)\b|"
+    r"\b(trump|white house|u\.?s\.?|china|eu|beijing)\b.{0,40}\b(imposes?|announces?|raises?|slaps?|to impose)\b.{0,30}\b(tariffs?|sanctions|export (ban|controls?))\b|"
+    r"\bexecutive order\b.{0,40}\b(signs?|signed)\b|\bsigns?\b.{0,30}\bexecutive order\b", re.I)
+# top-tier FJ_MAJOR events (central-bank decisions, war on a capital/nuclear site, declared war/invasion/coup): floor at FJ_MIN_SCORE
+FJ_TOP = re.compile(
+    r"\b(fed|fomc|federal reserve|ecb|boe|boj|bank of (england|japan))\b.{0,40}\b(cuts?|raises?|hikes?|holds?|leaves|keeps|unexpectedly)\b.{0,30}\b(rates?|basis points|bps|bp)\b|"
+    r"\bemergency (rate|meeting|cut)\b|\bdeclares? war\b|\binva(des?|sion)\b|\bcoup\b|\bmartial law\b|\bnuclear (test|strike|attack)\b|"
+    r"\b(attacks?|strikes?|missiles?|drones?|bomb\w*|explosions?)\b.{0,50}\b(riyadh|tehran|tel aviv|jerusalem|taipei|beijing|washington|seoul|abu dhabi|dubai|doha|pyongyang)\b|"
+    r"\b(strikes?|attacks?)\b.{0,30}\bnuclear (plant|site|facilit\w*)\b", re.I)
+FJ_WIRE_ATTRIB = re.compile(r"[:\-–]\s*(reuters|bloomberg|ap|associated press|nikkei|bbc|wsj)\.?\s*$", re.I)
+FJ_ATTRIB_TAIL = re.compile(r"\s*(?::|-|–)\s*(ifx|tass|ria|cctv|state tv|statement|governor|nikkei|axios|reuters|bloomberg|"
+                            r"the times|kcna|tasnim|sepah news|govt data|government data|notice|[a-z]{2,12})\.?\s*$", re.I)
 NEWS_FEED_NAMES = {f[0] for f in NEWS_FEEDS}
 CRYPTO_FEED_NAMES = {f[0] for f in CRYPTO_FEEDS}
 
@@ -606,7 +681,7 @@ def _clean_title(name: str, it: dict) -> str:
     return title.strip()
 
 
-def score_news(name: str, tier: str, it: dict, feed_topic: str) -> tuple[int, list[str], str, str]:
+def score_news(name: str, tier: str, it: dict, feed_topic: str, event_hint: bool = False) -> tuple[int, list[str], str, str]:
     """General breaking-news scoring (markets, macro, crypto, big tech, world). Returns score, why, title, topic."""
     title = _clean_title(name, it)
     gsrc = it.get("src", "")
@@ -651,12 +726,55 @@ def score_news(name: str, tier: str, it: dict, feed_topic: str) -> tuple[int, li
     # hard gates: needs a named entity AND an event
     if not groups:
         s = min(s, NEWS_HIT_THRESHOLD - 1); why.append("gate:no-entity")
-    if not (ev or big):
+    if not (ev or big or event_hint):       # event_hint: caller (FinancialJuice) already matched a major event
         s = min(s, NEWS_HIT_THRESHOLD - 1); why.append("gate:no-event")
     topic = next((t for t, g in TOPIC_ORDER if g in groups), feed_topic or "World")
     if feed_topic == "Crypto" and "crypto" in groups:
         topic = "Crypto"
     return s, why, title, topic
+
+
+def _num(x: str) -> float | None:
+    try:
+        return float(x.replace(",", ""))
+    except Exception:
+        return None
+
+
+def score_fj(name: str, tier: str, it: dict) -> tuple[int, list[str], str, str]:
+    """FinancialJuice: strict. Drop routine squawk; pass only FJ_MAJOR events / big data surprises, score >= FJ_MIN_SCORE."""
+    title = FJ_PREFIX.sub("", it["title"]).strip().rstrip(".")
+    why = ["fj-lead"]
+    m = FJ_DATA.search(title)
+    if m:                                    # economic data print
+        ind = m.group("ind").strip()
+        rule = next((d for rx, d in FJ_DATA_MAJOR if rx.search(ind)), None)
+        if rule is None:
+            return -40, why + ["fj:minor data print"], title, ""
+        a, f = _num(m.group("a")), _num(m.group("f"))
+        if rule > 0 and (a is None or f is None or abs(a - f) < rule):
+            return -30, why + [f"fj:in-line print ({ind})"], title, ""
+        return FJ_MIN_SCORE + 1, why + [f"fj:major data {ind} actual {m.group('a')} vs {m.group('f')}", "big:data-surprise"], title, "Macro"
+    core = FJ_ATTRIB_TAIL.sub("", title)     # drop trailing attribution (": governor", "- RIA", ": Nikkei")
+    body = core
+    sp = FJ_SPEAKER.match(core)
+    if sp:
+        body = core.split(":", 1)[1].strip()
+    if FJ_NOISE.search(title):
+        return -40, why + ["fj:routine/noise"], title, ""
+    major = FJ_MAJOR.search(body)
+    if not major:
+        return -20, why + (["fj:speaker soundbite"] if sp else ["fj:not headline-worthy"]), title, ""
+    sc, w2, clean, topic = score_news(name, tier, {**it, "title": core, "src": ""}, "", event_hint=True)
+    if sc < -5:                               # spam/fluff/clickbait gates from the main scorer still apply
+        return sc, why + w2, title, ""
+    if not any(x.startswith("big:") for x in w2):
+        sc += 4                               # the FJ_MAJOR match counts as a NEWS_BIG event
+    sc += 3                                   # FJ_MAJOR bonus (aggregator tier already -1)
+    if FJ_TOP.search(body) and sc < FJ_MIN_SCORE:
+        sc = FJ_MIN_SCORE; why.append("fj-top-floor")
+    why += w2 + ["fj-major:" + major.group(0).lower()[:30]]
+    return sc, why, title, topic or "World"
 
 
 _NEWS_EVENT_STEMS = [("rates", r"rate|fomc|cuts|hikes|holds"), ("data", r"cpi|ppi|inflation|payroll|jobs|gdp|unemploy"),
@@ -1030,6 +1148,8 @@ def is_fast_lane(name: str, it: dict, score: int) -> bool:
     if score < FAST_LANE_MIN_SCORE:
         return False
     src = (it.get("src") or "").strip()
+    if name == FJ_NAME:
+        return score >= FJ_MIN_SCORE + 2 and bool(FJ_WIRE_ATTRIB.search(it.get("title", "")))
     if name.startswith("GN:"):
         # aggregator results only count when the publisher itself is a top wire / official source
         if src:
@@ -1058,6 +1178,13 @@ def poll_feed(name: str, url: str, tier: str, topic: str, st: dict, t: float, fi
     hits = []
     primed = st.setdefault("primed_feeds", {})
     was_primed = bool(primed.get(name))
+    if items and name in PRIME_ON_FIRST_FETCH and not was_primed:
+        for it in items:            # new feed: mark the backlog seen, send nothing this time
+            if it.get("link"):
+                seen[norm_url(it["link"])] = t
+        primed[name] = t
+        log.info("feed %s primed (%d items marked seen)", name, len(items))
+        return []
     if items:
         primed[name] = t
     for it in items:
@@ -1081,14 +1208,18 @@ def poll_feed(name: str, url: str, tier: str, topic: str, st: dict, t: float, fi
             sc, why, clean = score_ai(name, tier, it)
             item_topic, thr = "AI", AI_HIT_THRESHOLD
         else:
-            sc, why, clean, item_topic = score_news(name, tier, it, topic)
-            thr = CRYPTO_HIT_THRESHOLD if item_topic == "Crypto" else NEWS_HIT_THRESHOLD
+            if name == FJ_NAME:
+                sc, why, clean, item_topic = score_fj(name, tier, it)
+                thr = FJ_MIN_SCORE
+            else:
+                sc, why, clean, item_topic = score_news(name, tier, it, topic)
+                thr = CRYPTO_HIT_THRESHOLD if item_topic == "Crypto" else NEWS_HIT_THRESHOLD
         if sc < thr:
             continue
         if item_topic == "AI":
             skey, win, stories = ai_story_key(why, clean), AI_STORY_DEDUPE_S, st.setdefault("ai_stories", {})
         else:
-            skey, win, stories = story_key(clean), STORY_DEDUPE_S, st.setdefault("stories", {})
+            skey, win, stories = story_key(FJ_ATTRIB_TAIL.sub("", clean) if name == FJ_NAME else clean), STORY_DEDUPE_S, st.setdefault("stories", {})
         if skey and t - stories.get(skey, 0) < win:
             continue
         toks = title_tokens(clean)
@@ -1107,6 +1238,9 @@ def poll_feed(name: str, url: str, tier: str, topic: str, st: dict, t: float, fi
             "detect_lag_s": round(t - it["date"]), "handled": False,
             "priority": is_fast_lane(name, it, sc), "instance": INSTANCE,
         })
+        if name == FJ_NAME:
+            hits[-1].update(lead_only=True, verify_note="FinancialJuice squawk = lead only. Confirm at the primary "
+                            "source (company/central bank/government/wire) and cite that, never FinancialJuice.")
     return hits
 
 
