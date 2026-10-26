@@ -64,9 +64,9 @@ PRICE_ALERTS_ENABLED = os.environ.get("HERALD_PRICES", "1") == "1"
 NEWS_ENABLED = os.environ.get("HERALD_NEWS", "1") == "1"
 
 # ---- webhook limits (breaking-news level)
-ESC_MIN_GAP_S = 3 * 60              # normal batches: at most one webhook every 3 min (latency pass: was 8)
-ESC_MAX_PER_DAY = 60                # per EAT day (latency pass: was 40)
-ESC_RESERVE_FOR_URGENT = 10         # the last 10 of the daily cap are kept for urgent (fast-lane) hits only
+ESC_MIN_GAP_S = 5 * 60              # normal batches: at most one every 5 min (scoring pass; latency pass had 3, before that 8)
+ESC_MAX_PER_DAY = 100               # per EAT day (scoring pass; latency pass had 60, before that 40)
+ESC_RESERVE_FOR_URGENT = 20         # the last 20 of the daily cap are kept for urgent (fast-lane) hits only
 MAX_HITS_PER_WEBHOOK = 6            # several hits batched per webhook, best first
 AI_MAX_HITS_PER_POST = 3            # AI can't crowd out the rest of a batch
 AI_HIT_THRESHOLD = 9
@@ -150,6 +150,11 @@ NEWS_FEEDS = [
     ("GN: Reuters markets", gnews("site:reuters.com/markets when:1h"), "reputable", 60),
     ("GN: AP", gnews("site:apnews.com when:1h"), "reputable", 60),
     ("GN: Bloomberg", gnews("site:bloomberg.com when:1h"), "reputable", 60),
+    # scoring pass 2026-10-26: megacap company releases (IR sites/newsrooms and their PR/Business Wire copies)
+    ("GN: megacap newsrooms", gnews("(site:investor.atmeta.com OR site:about.fb.com OR site:nvidianews.nvidia.com OR site:news.microsoft.com "
+                                    "OR site:apple.com/newsroom OR site:aboutamazon.com OR site:abc.xyz OR site:ir.tesla.com OR site:openai.com/index) when:1d"), "official", 120),
+    ("GN: megacap press wires", gnews("(site:prnewswire.com OR site:businesswire.com OR site:globenewswire.com) "
+                                      "(Meta OR Apple OR Microsoft OR Nvidia OR Amazon OR Alphabet OR Tesla OR Broadcom OR Oracle OR Netflix OR JPMorgan) when:1d"), "official", 120),
     # ---- speed fixes 2026-10-26: direct wires + world/politics (all curl-checked 2026-10-26 ~09:00 EAT)
     ("BBC Top Stories", "https://feeds.bbci.co.uk/news/rss.xml", "reputable", 30),
     ("BBC Africa", "https://feeds.bbci.co.uk/news/world/africa/rss.xml", "reputable", 180),
@@ -169,7 +174,8 @@ NEWS_FEEDS = [
 # feeds added in the latency pass: their first fetch only marks items seen (no backlog burst)
 LATENCY_NEW_FEEDS = {"Federal Reserve monetary", "White House actions", "ECB press", "Bank of England news", "Bank of Japan",
                      "Bank of Canada press", "BEA releases", "GN: central banks", "GN: megacap deals",
-                     "GN: Reuters business", "GN: Reuters markets"}
+                     "GN: Reuters business", "GN: Reuters markets",
+                     "GN: megacap newsrooms", "GN: megacap press wires"}
 
 CRYPTO_FEEDS = [
     ("CoinDesk", "https://www.coindesk.com/arc/outboundfeeds/rss/", "reputable", 90),
@@ -636,7 +642,19 @@ ENT = {
                         r"\bchile(an)?\b|\bperu(vian)?\b|\bcuba(n)?\b|\bphilippines\b|\bindonesia(n)?\b|\bvietnam(ese)?\b|"
                         r"\bthailand\b|\bmyanmar\b|\bbangladesh\b|\bsri lanka\b|\baustralia(n)?\b|\bnew zealand\b|"
                         r"\bgeorgia\b(?! state)|\bmoldova\b|\bromania(n)?\b|\bbelarus\b|\bqatar\b|\bsudan\b|\bniger\b|"
-                        r"\bmali\b|\bdrc\b|\bcongo\b|\bsomalia\b|\bhaiti\b|\bbolivia\b|\becuador\b|\bunited nations\b|\bu\.?n\.? (security council|chief)\b", re.I),
+                        r"\bmali\b|\bdrc\b|\bcongo\b|"
+                        # 2026-10-26 scoring pass: countries/capitals/bodies seen in missed stories
+                        r"\bjordan(ian)?\b(?! (peterson|spieth|love|poole|clarkson|henderson|chiles|brand))|\bengland\b|\bscotland\b|\bwales\b|\bwelsh\b|\bscottish\b|\bireland\b|\birish\b|"
+                        r"\bnhs\b|\bbma\b|\bafrica cdc\b|\bafrica\b|\bafrican union\b|\bwho\b(?= (says|declares|warns|chief|director))|world health organi[sz]ation|"
+                        r"\btehran\b|\briyadh\b|\bmoscow\b|\bkyiv\b|\bbeijing\b|\bjerusalem\b|\bislamabad\b|\bankara\b|\bcairo\b|\bdamascus\b|\bbeirut\b|\bbaghdad\b|"
+                        r"\blondon\b|\bparis\b|\bberlin\b|\btokyo\b|\bseoul\b|\bnew delhi\b|\bwest bank\b|\bpalestin\w*\b|\bkuwait\w*\b|\boman\b|\bbahrain\w*\b|"
+                        r"\blibya\w*\b|\btunisia\w*\b|\balgeria\w*\b|\bmoroc\w*\b|\bkazakh\w*\b|\barmenia\w*\b|\bazerbaijan\w*\b|\bnepal\w*\b|\bcambodia\w*\b|"
+                        r"\bmalaysia\w*\b|\bsingapore\w*\b|\bhong kong\b|\bgreece\b|\bgreek\b|\bportug\w*\b|\bswed(en|ish)\b|\bnorw(ay|egian)\b|\bfin(land|nish)\b|"
+                        r"\bdenmark\b|\bdanish\b|\bbelgi\w*\b|\baustria\w*\b|\bczech\b|\bcroatia\w*\b|\bbosnia\w*\b|\bkosovo\b|\bcyprus\b|\bzimbabwe\w*\b|\bzambia\w*\b|"
+                        r"\bmozambique\b|\bangola\w*\b|\bsenegal\w*\b|\bcameroon\w*\b|\bchad\b|\bburkina\b|\bsouth sudan\b|\beritrea\w*\b|\bburundi\w*\b|\bmalawi\w*\b|"
+                        r"\bmadagascar\b|\bnicaragua\w*\b|\bguatemala\w*\b|\bhonduras\b|\bel salvador\b|\bpanama\w*\b|\bgulf\b(?= (states|nations|of|countries))|\bmideast\b|\bmiddle east\b|"
+                        r"\bmecca pact\b|\bemirati\b|\bqatari\b|\bsaudis?\b|\bsomali\b|\bethiopian\b|\bcongolese\b|"
+                        r"\bsomalia\b|\bhaiti\b|\bbolivia\b|\becuador\b|\bunited nations\b|\bu\.?n\.? (security council|chief)\b", re.I),
     # 2026-10-26: politics/leaders (elections, resignations, deaths of leaders)
     "politics": re.compile(r"\belections?\b|\bpresiden(t|cy|tial)\b|prime minister|\bpremier\b|\b(ex-|former )?pm\b|\bchancellor\b|"
                            r"\bparliament(ary)?\b|\breferendum\b|\brunoff\b|\bopposition leader\b|\bking\b|\bpope\b|\bmonarch\b|"
@@ -648,6 +666,56 @@ ENT = {
                          r"\bmartial law\b|state of emergency|\bhurricane\b|\btyphoon\b|\bcyclone\b|\bvolcan|\bnuclear\b|"
                          r"\bterror(ist)? attack\b|\bmass shooting\b|\bplane crash\b|\bwar\b", re.I),
 }
+HARD_EVENT = re.compile(
+    # labour action
+    r"\b(to|will|on|set to|begin|begins|began|announce[sd]?|call(s|ed)?|stage[sd]?|vote[sd]? (to|for))\s+(an?\s+)?(\w+-day\s+|\w+-hour\s+|national\s+|general\s+|indefinite\s+|new\s+)?(strikes?|walkouts?)\b|"
+    r"\bgo on (an? )?(\w+-day |\w+-hour |national |general |indefinite )?strike\b|\bgeneral strike\b|\bwalk-?outs?\b|\bstrike action\b|\bstrike (over|for|by|at)\b(?! (iran|israel|gaza|ukraine|russia))|"
+    # outbreaks
+    r"\bebola\b|\bcholera\b|\bmpox\b|\bmarburg\b|\bbird flu\b|\bh5n1\b|\boutbreak\b|\bepidemic\b|\bpandemic\b|\bpublic health emergency\b|"
+    # attacks, arrests in major incidents
+    r"\b(deadly|fatal|terror|terrorist|suicide|mass|church|mosque|synagogue|school)\b.{0,25}\b(attack|shooting|bombing|blast|explosion|stabbing|massacre)\b|"
+    r"\b(shooting|bombing|blast|explosion|gunmen)\b.{0,30}\b(kills?|killed|dead|deaths)\b|"
+    r"\bkill(s|ed)? (at least |more than |over )?(\d{2,}|dozens|scores|hundreds)\b|\b(\d{2,}|dozens|scores|hundreds) (people |civilians )?(killed|dead)\b|"
+    r"\bhostages?\b|\bshootout\b|\bgunmen\b|"
+    r"\barrest(s|ed)?\b.{0,50}\b(attack|bombing|shooting|assassination|plot|massacre|explosion)\b|\bsuspects?\b.{0,40}\b(attack|bombing|shooting)\b|"
+    # crisis diplomacy
+    r"\b(officials|security chiefs|chiefs|ministers|delegations?|envoys?|leaders|mediators|negotiators)\b.{0,50}\b(meet|meets|met|visit|visits|arrive|arrives|hold talks|holds talks|for talks|in talks)\b|"
+    r"\bdelegations? meet\b|\bcrisis talks\b|\bpeace talks\b|\bemergency (summit|session|meeting|talks)\b|\brenewed fighting\b|"
+    r"\bexpels?\b.{0,25}\b(ambassador|diplomats?|envoy)\b|\bsever(s|ed)?\b.{0,20}\bties\b|\brecalls?\b.{0,10}\bambassador\b|"
+    # disasters
+    r"\boil (spill|slick)\b|\bspill\b.{0,25}\b(widens|spreads|grows)\b|\bwildfires?\b|\bfloods?\b.{0,25}\b(kill|dead|displace|evacuat)|\blandslide kills?\b|"
+    r"\bplane crash\b|\btrain crash\b|\bderail\w*\b|\b(building|bridge|dam|mine)\b.{0,15}\bcollapse|\bbeach(es)? (clos|shut)\w*|\bshuts?\b.{0,20}\bbeaches\b|"
+    r"\bmass evacuation\b|\bevacuat\w+ (thousands|residents|city|town)\b|\bstate of emergency\b|\bcyclone\b|\bhurricane\b|\btyphoon\b|\bearthquake\b|\bvolcan\w* erupt", re.I)
+HARD_EVENT_WIRE_BONUS = 4    # extra when a hard event comes from a wire / top-desk source (Reuters, AP, BBC, Bloomberg, ...)
+# Features, reactions and look-backs around a hard event: never the event itself
+HARD_EVENT_FEATURE = re.compile(r"\bdescribes?\b|\brecounts?\b|\bfuneral\b|\bvigil\b|\bremember\w*\b|\btributes?\b|\binside\b|\bwhat (we|you) (know|need)|"
+                                r"\bneed to know\b|\btimeline\b|\bin (maps|charts|pictures|photos)\b|\bphotos show\b", re.I)
+# Megacap company capital actions (stock/equity/debt offerings, giant buybacks) count as a big event
+MEGACAP_CAPITAL = re.compile(
+    r"\$\s?\d+(\.\d+)?\s?(billion|bn)\b.{0,40}\b(stock|equity|share|debt|bond|convertible)s?\b.{0,12}\b(offering|sale|raise|issuance|buyback|repurchase)|"
+    r"\b(stock|equity|share|debt|bond|convertible)s? (offering|sale|issuance|buyback|repurchase)\b.{0,40}\$\s?\d+(\.\d+)?\s?(billion|bn)|"
+    r"\b(raise|raises|raising|seeks|plans|launches|announces)\b.{0,30}\$\s?\d+(\.\d+)?\s?(billion|bn)\b.{0,30}\b(in )?(equity|stock|debt|bonds?|financing|share sale)\b|"
+    r"\b(public|proposed|registered|secondary|underwritten) offering\b|\boffering of\b.{0,40}\b(shares|stock|notes|depositary|preferred)\b", re.I)
+# Big-company newsrooms / IR sites (GN publisher name or link host) and their wire-distributed releases.
+MEGACAP_ISSUER = re.compile(r"^(meta( platforms)?|apple|microsoft|nvidia|amazon(\.com)?|alphabet|google|tesla|berkshire hathaway inc|broadcom|oracle|"
+                            r"jpmorgan( chase)?|netflix|openai|anthropic|spacex|xai|visa|mastercard|walmart|exxon ?mobil|eli lilly|tsmc|samsung( electronics)?)\b(?! \w+ (specialty|reinsurance|energy|homeservices))", re.I)
+MEGACAP_NEWSROOM_SRC = re.compile(r"^(meta( investor relations| newsroom)?|apple( newsroom)?|microsoft( news| investor relations)?|nvidia( newsroom)?|amazon( news)?|"
+                                  r"about amazon|alphabet( investor relations)?|tesla( investor relations)?|investor\.atmeta\.com|nvidianews\.nvidia\.com)$", re.I)
+PRESS_WIRES = re.compile(r"pr newswire|prnewswire|business wire|businesswire|globenewswire", re.I)
+# Previews, analyst notes, market wraps and FX commentary: not breaking news (a decision or print is)
+PREVIEW_JUNK = re.compile(
+    r"\bexpected to\b|\bexpects?\b|\bforecasts?\b|\bpredicts?\b|\bahead of\b|\bbraces?\b|\bawaits?\b|\bawaiting\b|\blooms?\b|\bodds\b|"
+    r"\bon the line\b|\bpre-?bell\b|\bpre-?market\b|\bstock market today\b|\bfutures (rise|fall|edge|climb|slip|dip|gain)|\bearnings call transcript\b|"
+    r"\bmaybe\b|\bpreview\b|\bwhat to watch\b|\blooks (beyond|ahead|to)\b|\bsoftens\b|\bpoises\b|\bhovers\b|\bdrifts\b|\bsteadies\b|\bfirms\b|"
+    r"\banalysts? (divided|say|see|warn)\b|\bwill (surge|soar|jump|rally|rise|climb|fall|drop|plunge|crash|double|triple)\b|\b(says|according to|per) (morgan stanley|goldman( sachs)?|jpmorgan|bofa|bank of america|citi(group)?|ubs|barclays|bernstein|jefferies|wedbush|analysts?)\s*$|\binvestors weigh\b|\bweighs? (in|up)\b|\breverses? (losses|gains)\b|\baccording to (one|an?) (wall street )?analyst\b|\bto buy (before|now)\b|"
+    r"\b(cryptocurrenc(y|ies)|coins?|tokens?|altcoins?|stocks?|shares?)\b.{0,15}\bto buy\b|\bdays away\b|,\s*more$|\bop-?ed\b|^i[’']?m\b|^i\b|^my\b|\bin (maps|charts|pictures)\b|[-–—]\s*(business|markets?|politics|world|news) live\s*$|\blive blog\b|\blatest (news|company updates|updates)\b|\byour questions,? answered\b", re.I)
+PREVIEW_OVERRIDE = re.compile(r"\b(crash\w*|plunge\w*|tumble\w*|record high|all[- ]time high|halt\w*|circuit breaker|emergency)\b", re.I)
+ANALYST_NOTE = re.compile(r"^(goldman( sachs)?|morgan stanley|jpmorgan|j\.p\. morgan|bofa|bank of america|citi(group)?|ubs|barclays|hsbc|wells fargo|"
+                          r"bernstein|jefferies|deutsche bank|nomura|bnp paribas|societe generale|rbc|td|capital economics|oxford economics)\b.{0,50}"
+                          r"\b(expects?|forecasts?|sees|predicts?|upgrades?|downgrades?|price target|target|recommends?|overweight|underweight|strategists?|economists?)\b", re.I)
+# Non-megacap quarterly results are not breaking news for us
+SMALL_EARNINGS = re.compile(r"\b(q[1-4]|quarterly|first-quarter|second-quarter|third-quarter|fourth-quarter|half-year|annual)\b.{0,25}\b(profit|revenue|earnings|net income|loss)\b|"
+                            r"\b(profit|net income|revenue)\b.{0,10}\b(falls|rises|jumps|drops|slumps|surges|climbs|declines)\b", re.I)
 ENT_WEIGHT = {"crypto": 4, "macro": 4, "markets": 3, "bigco": 3, "people": 3, "politics": 3, "crisis": 3, "world": 2}
 
 NEWS_EVENT = re.compile(
@@ -670,8 +738,8 @@ NEWS_EVENT = re.compile(
     r"\bdeclares?\b|\bdissolves?\b|\bcalls? (snap|early) election", re.I)
 NEWS_BIG = re.compile(
     r"\btrump\b.{0,50}\b(signs|announces|imposes|executive order|tariffs?|fires|pardons)|"
-    r"\b(fed|federal reserve|fomc|ecb|bank of japan|bank of england)\b.{0,40}\b(cuts|raises|hikes|holds|leaves)\b|"
-    r"rate (cut|hike)|emergency (rate|meeting)|"
+    r"\b(fed|federal reserve|fomc|ecb|bank of (japan|england|canada|korea)|rbnz|rba|reserve bank|snb|riksbank|central bank|pboc|rbi|boj|boe|boc)\b.{0,40}\b(cuts|raises|hikes|holds|leaves|lowers|keeps|delivers)\b|"
+    r"\b(surprise|unexpected|emergency|delivers?|announces?|approves?)\b.{0,12}\brate (cut|hike)|emergency (rate|meeting)|"
     r"\b(cpi|inflation|ppi|gdp|payrolls|jobs report|unemployment( rate)?|jobless claims|consumer price index|producer price index|retail sales)\b.{0,50}"
     r"(\d|than expected|expectations|rises|falls|jumps|slows|accelerat)|"
     r"wiped out|circuit breaker|record high|all[- ]time high|bear market|\bbankrupt|"
@@ -778,15 +846,30 @@ def score_news(name: str, tier: str, it: dict, feed_topic: str, event_hint: bool
     gsrc = it.get("src", "")
     summary = it.get("summary", "")[:300]
     why = []
-    if SPAM.search(f"{title} {gsrc} {it['link']}") or SPAM.search(summary[:200]) or AI_SPAM.search(f"{title} {gsrc}"):
+    # scoring pass 2026-10-26: a megacap's own release (IR site/newsroom, or a PR/Business Wire release whose
+    # issuer is the megacap itself) is an official source, not "press release" noise
+    try:
+        _host = urllib.parse.urlsplit(it.get("link", "")).netloc.lower()
+    except Exception:
+        _host = ""
+    company_release = bool(MEGACAP_NEWSROOM_SRC.search(gsrc.strip())
+                           or re.search(r"(^|\.)(investor\.atmeta\.com|about\.fb\.com|nvidianews\.nvidia\.com|news\.microsoft\.com|ir\.tesla\.com|abc\.xyz)$", _host)
+                           or (MEGACAP_ISSUER.search(title) and PRESS_WIRES.search(f"{gsrc} {_host}")))
+    if company_release:
+        tier = "official"; why.append("company-release")
+    elif SPAM.search(f"{title} {gsrc} {it['link']}") or SPAM.search(summary[:200]) or AI_SPAM.search(f"{title} {gsrc}"):
         return -99, ["spam/sponsored/low-trust"], title, ""
+    if (PREVIEW_JUNK.search(title) and not PREVIEW_OVERRIDE.search(title)) or ANALYST_NOTE.search(title):
+        return -40, ["preview/analyst-note/market-wrap"], title, ""
+    if HARD_EVENT.search(title) and HARD_EVENT_FEATURE.search(title):
+        return -40, ["feature/reaction piece"], title, ""
     if NEWS_FLUFF.search(title):
         return -50, ["fluff/opinion/explainer/live-blog"], title, ""
-    if CLICKBAIT.search(title) and not NEWS_BIG.search(title):
+    if CLICKBAIT.search(title) and not NEWS_BIG.search(title) and not MEGACAP_CAPITAL.search(title):
         return -50, ["clickbait/prediction"], title, ""
     if QUESTION_BAIT.search(title):
         return -20, ["question headline"], title, ""
-    if name.startswith("GN:") and gsrc and not TRUSTED_PUBLISHERS.search(gsrc.strip()):
+    if name.startswith("GN:") and gsrc and not company_release and not TRUSTED_PUBLISHERS.search(gsrc.strip()):
         return -30, ["untrusted publisher:" + gsrc[:30]], title, ""
     if name in OFFICIAL_RELEVANT and not OFFICIAL_RELEVANT[name].search(f"{title} {summary}"):
         return -10, ["routine official release"], title, ""
@@ -803,8 +886,15 @@ def score_news(name: str, tier: str, it: dict, feed_topic: str, event_hint: bool
     if ev:
         s += min(2, len(ev)) * 2; why.append("event:" + ",".join(sorted(ev))[:50])
     big = NEWS_BIG.search(title)
+    if not big and "bigco" in groups:
+        big = MEGACAP_CAPITAL.search(title)
     if big:
         s += 4; why.append("big:" + big.group(0).lower()[:30])
+    hard = HARD_EVENT.search(title)
+    if hard:
+        s += 3; why.append("hard:" + hard.group(0).lower()[:30])
+        if _wire_grade(name, it):
+            s += HARD_EVENT_WIRE_BONUS; why.append("wire")
     for m in MONEY.finditer(title):
         v = float(m.group(1)) * (1000 if m.group(2).lower()[0] == "b" else 1)
         if v >= 1000:
@@ -817,7 +907,9 @@ def score_news(name: str, tier: str, it: dict, feed_topic: str, event_hint: bool
     # hard gates: needs a named entity AND an event
     if not groups:
         s = min(s, NEWS_HIT_THRESHOLD - 1); why.append("gate:no-entity")
-    if not (ev or big or event_hint):       # event_hint: caller (FinancialJuice) already matched a major event
+    if SMALL_EARNINGS.search(title) and "bigco" not in groups:
+        s = min(s, NEWS_HIT_THRESHOLD - 1); why.append("gate:non-megacap-earnings")
+    if not (ev or big or hard or event_hint):       # event_hint: caller (FinancialJuice) already matched a major event
         s = min(s, NEWS_HIT_THRESHOLD - 1); why.append("gate:no-event")
     topic = next((t for t, g in TOPIC_ORDER if g in groups), feed_topic or "World")
     if feed_topic == "Crypto" and "crypto" in groups:
@@ -1196,12 +1288,13 @@ def maybe_escalate(st: dict, dry: bool):
         return
     reserve_only = esc["count"] >= ESC_MAX_PER_DAY - ESC_RESERVE_FOR_URGENT
     gap = t - esc.get("last", 0)
+    batch_gap = t - esc.get("last_batch", esc.get("last", 0))
     rank = lambda h: (not h.get("priority"), -h.get("score", 0), -h.get("published_ts", 0))
     urgent = sorted([h for h in pend if is_urgent(h)], key=rank)
     fast_lane = False
     if urgent and gap >= FAST_LANE_MIN_GAP_S:
         send, fast_lane = urgent[:URGENT_MAX_PER_WEBHOOK], True
-    elif gap >= ESC_MIN_GAP_S and not reserve_only:
+    elif batch_gap >= ESC_MIN_GAP_S and gap >= FAST_LANE_MIN_GAP_S and not reserve_only:
         # priority hits first, then by score
         send, n_ai = [], 0
         for h in sorted(pend, key=rank):
@@ -1243,6 +1336,8 @@ def maybe_escalate(st: dict, dry: bool):
     if post_webhook(cfg, payload):
         esc["count"] += 1
         esc["last"] = t
+        if not fast_lane:
+            esc["last_batch"] = t
         sent = {id(h) for h in send}
         # unsent lower-ranked hits stay pending for the next window while still fresh
         st["pending_escalation"] = [h for h in pend if id(h) not in sent]
@@ -1252,10 +1347,17 @@ def maybe_escalate(st: dict, dry: bool):
                  len(st["pending_escalation"]), esc["count"], ESC_MAX_PER_DAY)
     else:
         esc["last"] = t      # retry: urgent after 30 s, normal batch after ESC_MIN_GAP_S
+        if not fast_lane:
+            esc["last_batch"] = t
 
 
 # ------------------------------------------------------------------ cycle
 UNDATED_FEEDS = {"Nikkei Asia"}
+
+
+def _wire_grade(name: str, it: dict) -> bool:
+    """Wire / top-desk source (Reuters, AP, BBC, Bloomberg, Nikkei, CNBC, WSJ, official feeds), any score."""
+    return name != FJ_NAME and is_fast_lane(name, it, FAST_LANE_MIN_SCORE)
 
 
 def is_fast_lane(name: str, it: dict, score: int) -> bool:
@@ -1267,7 +1369,9 @@ def is_fast_lane(name: str, it: dict, score: int) -> bool:
     if name.startswith("GN:"):
         # aggregator results only count when the publisher itself is a top wire / official source
         if src:
-            return bool(FAST_LANE_PUBLISHERS.search(src))
+            # scoring pass: a megacap's own release (IR/newsroom, or PR/Business Wire with the megacap as issuer) is first-hand
+            return bool(FAST_LANE_PUBLISHERS.search(src) or MEGACAP_NEWSROOM_SRC.search(src)
+                        or (PRESS_WIRES.search(src) and MEGACAP_ISSUER.search(_clean_title(name, it))))
     elif FAST_LANE_FEEDS.search(name):
         return True
     try:
@@ -1464,6 +1568,8 @@ def main():
     ap.add_argument("--max-age-min", type=float, help="override freshness window (testing)")
     ap.add_argument("--prime", action="store_true",
                     help="one pass that only marks every current item as seen (sends nothing); for a fresh state file")
+    ap.add_argument("--run-for", type=float, default=0, metavar="SECONDS",
+                    help="loop mode with a time limit: poll continuously, then save state and exit 0 after SECONDS (GitHub Actions chunks)")
     a = ap.parse_args()
     global MAX_AGE_MIN, PRICE_ALERTS_ENABLED
     if a.max_age_min:
@@ -1488,6 +1594,7 @@ def main():
         for k in ("seen_urls", "recent_hits", "http_cache", "stories", "ai_stories", "feed_last_fetch"):
             st[k] = {} if k != "recent_hits" else []
     n_cycles = 0
+    deadline = time.time() + a.run_for if a.run_for and not a.once else 0
     while True:
         try:
             hits = cycle(st, a.dry_run, force_all=a.once)
@@ -1509,7 +1616,14 @@ def main():
         end = time.time() + TICK_SECONDS
         while time.time() < end and not _stop:
             time.sleep(1)
-        if _stop:
+        if deadline and time.time() >= deadline and not _stop:
+            ok = sum(1 for v in st.get("feed_health", {}).values() if v.get("ok"))
+            log.info("run-for limit reached after %d cycles | feeds ok %d/%d | escalations today %s/%d",
+                     n_cycles, ok, len(st.get("feed_health", {})), st.get("escalations", {}).get("count", 0), ESC_MAX_PER_DAY)
+            _stop_now = True
+        else:
+            _stop_now = False
+        if _stop or _stop_now:
             log.info("watcher stop")
             if not a.dry_run:
                 save_state(st)

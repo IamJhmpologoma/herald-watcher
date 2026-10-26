@@ -1,20 +1,27 @@
 # Always-on copy of the Herald breaking-news watcher (@JhMpologoma). Public repo; secrets live in Actions secrets only.
 # Secrets: HERALD_WEBHOOK_URL, HERALD_WEBHOOK_KEY (set with `gh secret set ... < file`, never echoed).
+#
+# 2026-10-26 scoring pass: one long-running job instead of a 5-minute cron (scheduled 5-min runs rarely fired).
+# The job polls continuously (watcher loop: 5 s tick, each feed every 30-60 s+) for ~5h42m in 6 chunks of 57 min.
+# State is saved to the Actions cache after every chunk and at the end (always), so a cancelled or failed run
+# never resends old alerts. Runs never overlap (concurrency group); the next run is queued by the cron
+# (every 5 h) and by a self-dispatch at the end of each run, and starts as soon as the current one ends.
+# Stop it: gh workflow disable herald-watcher.yml -R IamJhmpologoma/herald-watcher
 name: herald-watcher
 on:
   schedule:
-    # 2026-10-26 latency pass: offset from :00/:05 (GitHub sheds top-of-the-hour load first) and re-registered
-    - cron: "2-59/5 * * * *"   # GitHub's minimum is 5 min; real start times can drift 5-15 min under load
+    - cron: "40 */5 * * *"     # backup trigger every 5 h; a queued run waits for the running one (no overlap)
   workflow_dispatch: {}
 concurrency:
   group: herald-watcher
   cancel-in-progress: false
 permissions:
   contents: read
+  actions: write               # self-dispatch of the next run (workflow_dispatch via GITHUB_TOKEN is allowed)
 jobs:
-  poll:
+  loop:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 355       # GitHub hard limit is 360 min per job
     env:
       HERALD_INSTANCE: gha
       HERALD_STATE_PATH: ${{ github.workspace }}/state/state.json
@@ -25,6 +32,7 @@ jobs:
       HERALD_WEBHOOK_KEY: ${{ secrets.HERALD_WEBHOOK_KEY }}
       HERALD_WEBHOOK_AUTH_HEADER: Authorization
       HERALD_WEBHOOK_AUTH_SCHEME: Bearer
+      PYTHONUNBUFFERED: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -33,17 +41,80 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: state
-          key: herald-state-${{ github.run_id }}
+          key: herald-state-${{ github.run_id }}-${{ github.run_attempt }}-start
           restore-keys: herald-state-
-      - name: Poll once
+      - name: Prime if no state
         run: |
           mkdir -p state
           if [ ! -f state/state.json ]; then python watcher.py --prime; fi   # first run: mark current items seen, send nothing
-          python watcher.py --once
-          tail -n 20 state/watcher.log | grep -v -i "webhook POST" || true
-      - name: Save state
+      - name: Poll loop 1/6 (57 min)
+        id: loop1
+        continue-on-error: true
+        if: ${{ !cancelled() }}
+        run: python watcher.py --run-for 3420 -v 2>&1 | grep --line-buffered -v -i "webhook POST"
+      - name: Save state (1/6)
         if: always()
         uses: actions/cache/save@v4
         with:
           path: state
-          key: herald-state-${{ github.run_id }}
+          key: herald-state-${{ github.run_id }}-${{ github.run_attempt }}-c1
+      - name: Poll loop 2/6 (57 min)
+        id: loop2
+        continue-on-error: true
+        if: ${{ !cancelled() }}
+        run: python watcher.py --run-for 3420 -v 2>&1 | grep --line-buffered -v -i "webhook POST"
+      - name: Save state (2/6)
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state
+          key: herald-state-${{ github.run_id }}-${{ github.run_attempt }}-c2
+      - name: Poll loop 3/6 (57 min)
+        id: loop3
+        continue-on-error: true
+        if: ${{ !cancelled() }}
+        run: python watcher.py --run-for 3420 -v 2>&1 | grep --line-buffered -v -i "webhook POST"
+      - name: Save state (3/6)
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state
+          key: herald-state-${{ github.run_id }}-${{ github.run_attempt }}-c3
+      - name: Poll loop 4/6 (57 min)
+        id: loop4
+        continue-on-error: true
+        if: ${{ !cancelled() }}
+        run: python watcher.py --run-for 3420 -v 2>&1 | grep --line-buffered -v -i "webhook POST"
+      - name: Save state (4/6)
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state
+          key: herald-state-${{ github.run_id }}-${{ github.run_attempt }}-c4
+      - name: Poll loop 5/6 (57 min)
+        id: loop5
+        continue-on-error: true
+        if: ${{ !cancelled() }}
+        run: python watcher.py --run-for 3420 -v 2>&1 | grep --line-buffered -v -i "webhook POST"
+      - name: Save state (5/6)
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state
+          key: herald-state-${{ github.run_id }}-${{ github.run_attempt }}-c5
+      - name: Poll loop 6/6 (57 min)
+        id: loop6
+        continue-on-error: true
+        if: ${{ !cancelled() }}
+        run: python watcher.py --run-for 3420 -v 2>&1 | grep --line-buffered -v -i "webhook POST"
+      - name: Save state (6/6)
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state
+          key: herald-state-${{ github.run_id }}-${{ github.run_attempt }}-c6
+      - name: Queue the next run (keeps the watcher always on)
+        if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run herald-watcher.yml -R "${{ github.repository }}" --ref "${{ github.ref_name }}"
