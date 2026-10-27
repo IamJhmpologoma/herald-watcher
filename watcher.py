@@ -160,6 +160,7 @@ NEWS_FEEDS = [
     ("BBC Africa", "https://feeds.bbci.co.uk/news/world/africa/rss.xml", "reputable", 180),
     ("Nikkei Asia", "https://asia.nikkei.com/rss/feed/nar", "reputable", 90),       # undated items: first-seen time used
     ("Japan Times", "https://www.japantimes.co.jp/feed/", "reputable", 180),
+    ("Yonhap", "https://en.yna.co.kr/RSS/news.xml", "reputable", 120),   # speed research 2026-10-27: Korea markets/N. Korea first-hand
     ("Guardian World", "https://www.theguardian.com/world/rss", "reputable", 90),
     ("DW", "https://rss.dw.com/rdf/rss-en-all", "reputable", 120),
     ("France 24", "https://www.france24.com/en/rss", "reputable", 120),
@@ -175,7 +176,7 @@ NEWS_FEEDS = [
 LATENCY_NEW_FEEDS = {"Federal Reserve monetary", "White House actions", "ECB press", "Bank of England news", "Bank of Japan",
                      "Bank of Canada press", "BEA releases", "GN: central banks", "GN: megacap deals",
                      "GN: Reuters business", "GN: Reuters markets",
-                     "GN: megacap newsrooms", "GN: megacap press wires"}
+                     "GN: megacap newsrooms", "GN: megacap press wires", "Yonhap"}
 
 CRYPTO_FEEDS = [
     ("CoinDesk", "https://www.coindesk.com/arc/outboundfeeds/rss/", "reputable", 90),
@@ -282,7 +283,7 @@ FJ_MAJOR = re.compile(
     r"\b(1\d|[2-9]\d)(\.\d+)?% in a day\b|"
     # war / geopolitical shock
     r"\bdeclares? war\b|\binva(des?|sion)\b|\bnuclear (test|strike|attack|weapon)\b|\bmartial law\b|\bcoup\b|\bassassinat|"
-    r"\bstate of emergency\b|\bceasefire\b.{0,30}\b(agreed|reached|signed|collapses|ends|announced)\b|"
+    r"\bstate of emergency\b|\bceasefire\b.{0,30}\b(agreed|reached|signed|collapses|ends|announced|takes effect|starts|begins)\b|"
     r"\b(attacks?|strikes?|missiles?|drones?|bomb\w*|explosions?)\b.{0,50}\b(riyadh|tehran|tel aviv|jerusalem|taipei|beijing|washington|seoul|abu dhabi|dubai|doha|pyongyang)\b|"
     r"\b(strikes?|attacks?)\b.{0,30}\bnuclear (plant|site|facilit\w*)\b|"
     r"\bstrait of hormuz\b.{0,40}\b(closed?|clos(es|ing)|block\w*|mine\w*)\b|"
@@ -297,6 +298,16 @@ FJ_MAJOR = re.compile(
     r"\b(bankrupt\w*|chapter 11|defaults? on)\b|"
     r"\b(trump|white house|u\.?s\.?|china|eu|beijing)\b.{0,40}\b(imposes?|announces?|raises?|slaps?|to impose)\b.{0,30}\b(tariffs?|sanctions|export (ban|controls?))\b|"
     r"\bexecutive order\b.{0,40}\b(signs?|signed)\b|\bsigns?\b.{0,30}\bexecutive order\b", re.I)
+# speed research 2026-10-27: headline-grade company / AI / legal / regulatory events. These hit FJ first but were dropped
+# (Anthropic S-1, MSFT 60k buyouts, GPT-6.1, Comey charged, Ripple OCC approval). Matched on the full line; floor at FJ_MIN_SCORE.
+FJ_HEADLINE = re.compile(
+    r"\b(files?|filed|filing) (publicly )?for (an? )?(ipo|initial public offering|nasdaq listing|nyse listing)\b|\bapplied to list\b.{0,40}\b(nasdaq|nyse)\b|"
+    r"\b(lay ?offs?|lays? off|job cuts?|cuts?|cutting|eliminat\w+|buyouts?)\b.{0,40}\b(\d{2,3},?\d{3}|\d+(\.\d+)?\s?(k|thousand))\s+(jobs|workers|employees|staff|roles|positions)\b|"
+    r"\b(gpt|claude|gemini|grok|llama|qwen|deepseek)[- ]?\d+(\.\d+)?\b.{0,40}\b(is )?(rolling out|released?|launch(es|ed)?|unveil\w*|now available)\b|"
+    r"\b(releases?|launch(es)?|unveils?|rolls? out)\b.{0,20}\b(gpt|claude|gemini|grok|llama)[- ]?\d+(\.\d+)?\b|"
+    r"\b(charges?|charged|indicts?|indicted|arrests?|arrested)\b.{0,30}\b(former|ex-?)\s?(fbi director|cia director|president|prime minister|attorney general|national security adviser|secretary of \w+)\b|"
+    r"\b(former|ex-?)\s?(fbi director|cia director|president|prime minister)\b.{0,40}\b(charged|indicted|arrested|convicted|sentenced)\b|"
+    r"\b(final|full) (us |federal |regulatory |occ |sec )*approval\b|\bnational trust bank\b.{0,30}\b(approv\w+|charter)\b|\bapproves? (the )?(first )?spot\b.{0,20}\betfs?\b", re.I)
 # top-tier FJ_MAJOR events (central-bank decisions, war on a capital/nuclear site, declared war/invasion/coup): floor at FJ_MIN_SCORE
 FJ_TOP = re.compile(
     r"\b(fed|fomc|federal reserve|ecb|boe|boj|bank of (england|japan))\b.{0,40}\b(cuts?|raises?|hikes?|holds?|leaves|keeps|unexpectedly)\b.{0,30}\b(rates?|basis points|bps|bp)\b|"
@@ -837,6 +848,10 @@ def _clean_title(name: str, it: dict) -> str:
             title = title[: -(len(gsrc) + 3)]
         else:
             title = re.sub(r"\s+-\s+[^-]{2,40}$", "", title)
+    if name == "Yonhap":   # strip wire version tags so (URGENT)/(LEAD)/(2nd LD) copies dedupe; mark features as opinion
+        title = re.sub(r"^\((EDITORIAL|News Focus|Yonhap Feature|Yonhap Interview|Feature|Interview|Column)\)\s*", "Opinion: ", title, flags=re.I)
+        title = re.sub(r"^\((URGENT|LEAD|\d+(st|nd|rd|th) LD|Yonhap Exclusive)\)\s*", "", title, flags=re.I)
+        title = re.sub(r"\bN\. Korea", "North Korea", re.sub(r"\bS\. Korea", "South Korea", title))
     return title.strip()
 
 
@@ -945,7 +960,7 @@ def score_fj(name: str, tier: str, it: dict) -> tuple[int, list[str], str, str]:
         body = core.split(":", 1)[1].strip()
     if FJ_NOISE.search(title):
         return -40, why + ["fj:routine/noise"], title, ""
-    major = FJ_MAJOR.search(body)
+    major = FJ_MAJOR.search(body) or FJ_HEADLINE.search(core)
     if not major:
         return -20, why + (["fj:speaker soundbite"] if sp else ["fj:not headline-worthy"]), title, ""
     sc, w2, clean, topic = score_news(name, tier, {**it, "title": core, "src": ""}, "", event_hint=True)
@@ -956,6 +971,8 @@ def score_fj(name: str, tier: str, it: dict) -> tuple[int, list[str], str, str]:
     sc += 3                                   # FJ_MAJOR bonus (aggregator tier already -1)
     if FJ_TOP.search(body) and sc < FJ_MIN_SCORE:
         sc = FJ_MIN_SCORE; why.append("fj-top-floor")
+    elif FJ_HEADLINE.search(core) and sc < FJ_MIN_SCORE:
+        sc = FJ_MIN_SCORE; why.append("fj-headline-floor")
     why += w2 + ["fj-major:" + major.group(0).lower()[:30]]
     return sc, why, title, topic or "World"
 
@@ -1096,10 +1113,16 @@ CRYPTO_ASSETS = {"btc": "bitcoin", "eth": "ethereum", "sol": "solana", "xrp": "r
 CRYPTO_NAMES = {"btc": "Bitcoin $BTC", "eth": "Ethereum $ETH", "sol": "Solana $SOL", "xrp": "$XRP"}
 # Yahoo Finance chart API (free, no key; checked 2026-10-25). Futures trade ~23h on weekdays.
 MARKET_ASSETS = {"gold": ("GC=F", "Gold"), "spx": ("ES=F", "S&P 500 futures"),
-                 "ndx": ("NQ=F", "Nasdaq 100 futures"), "oil": ("CL=F", "WTI crude oil")}
+                 "ndx": ("NQ=F", "Nasdaq 100 futures"), "oil": ("CL=F", "WTI crude oil"),
+                 # speed research 2026-10-27: Brazil's crash (B3 circuit breaker) and the KOSPI rally were posted 44 min / ~3 h late
+                 "bvsp": ("^BVSP", "Brazil's Ibovespa"), "kospi": ("^KS11", "South Korea's KOSPI"),
+                 "nikkei": ("^N225", "Japan's Nikkei 225"), "hsi": ("^HSI", "Hong Kong's Hang Seng"),
+                 "usdbrl": ("BRL=X", "US dollar vs Brazilian real")}
+NON_USD_ASSETS = {"bvsp", "kospi", "nikkei", "hsi", "usdbrl"}   # quoted in points / BRL, not $
 # thresholds: (1h move %, move vs previous close %)
 MOVE_PCT = {"btc": (3.0, 5.0), "eth": (3.0, 6.0), "sol": (3.0, 7.0), "xrp": (3.0, 7.0),
-            "gold": (1.5, 2.5), "spx": (1.2, 2.0), "ndx": (1.5, 2.5), "oil": (3.0, 5.0)}
+            "gold": (1.5, 2.5), "spx": (1.2, 2.0), "ndx": (1.5, 2.5), "oil": (3.0, 5.0),
+            "bvsp": (3.0, 4.0), "kospi": (3.0, 3.5), "nikkei": (3.0, 3.5), "hsi": (3.0, 3.5), "usdbrl": (2.0, 3.0)}
 # round-number levels Watcher Guru-style ("Bitcoin falls under $80,000", "$2,500 $ETH")
 LEVEL_STEP = {"btc": 2500, "eth": 100, "sol": 10, "xrp": 0.10, "gold": 100}
 CRYPTO_POLL_S = 60
@@ -1110,7 +1133,9 @@ COOLDOWN_LEVEL_S = 6 * 3600
 LEVEL_HYST = 0.003                  # 0.3% band around a level to avoid flapping
 
 
-def _fmt_price(p: float) -> str:
+def _fmt_price(p: float, sym: str = "") -> str:
+    if sym in NON_USD_ASSETS:                       # indices / FX: points, no $ sign
+        return f"{p:,.2f}" if p < 100 else f"{p:,.0f}"
     return f"${p:,.0f}" if p >= 100 else (f"${p:,.2f}" if p >= 1 else f"${p:,.4f}")
 
 
@@ -1138,13 +1163,13 @@ def _price_alerts(st: dict, cur: dict, daych: dict, topic: str, names: dict, url
             if abs(pct) >= m1:
                 d = "up" if pct > 0 else "down"
                 fire(f"1h:{sym}:{d}", COOLDOWN_1H_S,
-                     f"{names[sym]} {'surges' if pct > 0 else 'drops'} {abs(pct):.1f}% in the past hour to {_fmt_price(p)}",
+                     f"{names[sym]} {'surges' if pct > 0 else 'drops'} {abs(pct):.1f}% in the past hour to {_fmt_price(p, sym)}",
                      sym, round(pct, 2), 11)
         c = daych.get(sym)
         if c is not None and abs(c) >= md:
             d = "up" if c > 0 else "down"
             fire(f"day:{sym}:{d}", COOLDOWN_DAY_S,
-                 f"{names[sym]} {'up' if c > 0 else 'down'} {abs(c):.1f}% {'in 24h' if topic == 'Crypto' else 'on the day'}, now {_fmt_price(p)}",
+                 f"{names[sym]} {'up' if c > 0 else 'down'} {abs(c):.1f}% {'in 24h' if topic == 'Crypto' else 'on the day'}, now {_fmt_price(p, sym)}",
                  sym, round(c, 2), 9)
         step = LEVEL_STEP.get(sym)
         if step and prev and sym in prev["p"]:
@@ -1187,7 +1212,7 @@ def check_market_prices(st: dict) -> list[dict]:
             continue
         m = json.loads(body)["chart"]["result"][0]["meta"]
         p, pc, mt = m.get("regularMarketPrice"), m.get("chartPreviousClose") or m.get("previousClose"), m.get("regularMarketTime")
-        if not p or not mt or now_ts() - mt > 20 * 60:      # market closed / stale quote: no alerts
+        if not p or not mt or now_ts() - mt > (40 if sym in NON_USD_ASSETS else 20) * 60:   # closed/stale (Asian index quotes lag ~20-30 min)
             continue
         cur[sym] = float(p)
         if pc:
