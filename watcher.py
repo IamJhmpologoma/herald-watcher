@@ -180,16 +180,16 @@ NEWS_FEEDS = [
     ("GN: crypto licences", gnews('(Binance OR Coinbase OR Kraken OR Ripple OR Tether OR Circle OR OKX OR Bybit OR Robinhood) (license OR licence OR charter OR "partnership") when:2h'), "aggregator", 180),
 ]
 # feeds added in the latency pass: their first fetch only marks items seen (no backlog burst)
-LATENCY_NEW_FEEDS = {"GN: IMF deals", "GN: The Information", "GN: leader talks", "GN: crypto licences", "Federal Reserve monetary", "White House actions", "ECB press", "Bank of England news", "Bank of Japan",
+LATENCY_NEW_FEEDS = {"GN: big tech x crypto", "GN: crypto law/courts", "GN: IMF deals", "GN: The Information", "GN: leader talks", "GN: crypto licences", "Federal Reserve monetary", "White House actions", "ECB press", "Bank of England news", "Bank of Japan",
                      "Bank of Canada press", "BEA releases", "GN: central banks", "GN: megacap deals",
                      "GN: Reuters business", "GN: Reuters markets",
                      "GN: megacap newsrooms", "GN: megacap press wires", "Yonhap"}
 
 CRYPTO_FEEDS = [
-    ("CoinDesk", "https://www.coindesk.com/arc/outboundfeeds/rss/", "reputable", 90),
-    ("The Block", "https://www.theblock.co/rss.xml", "reputable", 60),
-    ("Cointelegraph", "https://cointelegraph.com/rss", "reputable", 60),
-    ("Decrypt", "https://decrypt.co/feed", "reputable", 75),
+    ("CoinDesk", "https://www.coindesk.com/arc/outboundfeeds/rss/", "reputable", 45),
+    ("The Block", "https://www.theblock.co/rss.xml", "reputable", 45),
+    ("Cointelegraph", "https://cointelegraph.com/rss", "reputable", 45),
+    ("Decrypt", "https://decrypt.co/feed", "reputable", 60),
     ("Bitcoin Magazine", "https://bitcoinmagazine.com/feed", "reputable", 180),
     ("DL News", "https://www.dlnews.com/arc/outboundfeeds/rss/", "reputable", 180),
     ("Coinbase status", "https://status.coinbase.com/history.rss", "official", 180),
@@ -197,6 +197,12 @@ CRYPTO_FEEDS = [
     ("GN: Bitcoin", gnews("(Bitcoin OR BTC) (ETF OR buys OR reserve OR falls OR surges OR record OR liquidated) when:1h"), "aggregator", 150),
     ("GN: crypto policy", gnews("(crypto OR stablecoin OR \"digital asset\") (SEC OR Congress OR Senate OR Treasury OR bill OR \"executive order\" OR ban OR approves) when:1h"), "aggregator", 180),
     ("GN: crypto hack", gnews("(crypto OR exchange OR DeFi OR bridge) (hack OR exploit OR drained OR insolvency OR \"withdrawals halted\") when:2h"), "aggregator", 180),
+    # WG-speed audit 2026-10-28: WG crypto scoops we missed (Google MPC custody for banks, Thailand Supreme Court
+    # rules Bitcoin is property) came via CoinDesk / Crypto Briefing and no query matched them
+    ("GN: big tech x crypto", gnews('(Google OR Apple OR Microsoft OR Amazon OR Meta OR BlackRock OR JPMorgan OR Visa OR Mastercard OR PayPal OR Stripe OR Fidelity OR Nasdaq) '
+                                    '(crypto OR bitcoin OR stablecoin OR tokenized OR "digital assets" OR custody OR blockchain) when:1h'), "aggregator", 120),
+    ("GN: crypto law/courts", gnews('(Bitcoin OR crypto OR cryptocurrency) ("supreme court" OR court OR "legal tender" OR "legal property" OR parliament '
+                                    'OR "central bank" OR legalizes OR legalises OR recognizes OR recognises) when:1h'), "aggregator", 150),
     ("GN: ETH/SOL/XRP", gnews("(Ethereum OR Solana OR XRP OR Ripple) (ETF OR approves OR launches OR partnership OR record) when:1h"), "aggregator", 240),
 ]
 
@@ -725,7 +731,7 @@ PRESS_WIRES = re.compile(r"pr newswire|prnewswire|business wire|businesswire|glo
 PREVIEW_JUNK = re.compile(
     r"\bexpected to\b|\bexpects?\b|\bforecasts?\b|\bpredicts?\b|\bahead of\b|\bbraces?\b|\bawaits?\b|\bawaiting\b|\blooms?\b|\bodds\b|"
     r"\bon the line\b|\bpre-?bell\b|\bpre-?market\b|\bstock market today\b|\bfutures (rise|fall|edge|climb|slip|dip|gain)|\bearnings call transcript\b|"
-    r"\bmaybe\b|\bpreview\b|\bwhat to watch\b|\blooks (beyond|ahead|to)\b|\bsoftens\b|\bpoises\b|\bhovers\b|\bdrifts\b|\bsteadies\b|\bfirms\b|"
+    r"\bmaybe\b|(?<!to )(?<!\bto )\bpreview\b(?!\s+(a|an|its|new|crypto|security|custody)\b)|\bwhat to watch\b|\blooks (beyond|ahead|to)\b|\bsoftens\b|\bpoises\b|\bhovers\b|\bdrifts\b|\bsteadies\b|\bfirms\b|"
     r"\banalysts? (divided|say|see|warn)\b|\bwill (surge|soar|jump|rally|rise|climb|fall|drop|plunge|crash|double|triple)\b|\b(says|according to|per) (morgan stanley|goldman( sachs)?|jpmorgan|bofa|bank of america|citi(group)?|ubs|barclays|bernstein|jefferies|wedbush|analysts?)\s*$|\binvestors weigh\b|\bweighs? (in|up)\b|\breverses? (losses|gains)\b|\baccording to (one|an?) (wall street )?analyst\b|\bto buy (before|now)\b|"
     r"\b(cryptocurrenc(y|ies)|coins?|tokens?|altcoins?|stocks?|shares?)\b.{0,15}\bto buy\b|\bdays away\b|,\s*more$|\bop-?ed\b|^i[’']?m\b|^i\b|^my\b|\bin (maps|charts|pictures)\b|[-–—]\s*(business|markets?|politics|world|news) live\s*$|\blive blog\b|\blatest (news|company updates|updates)\b|\byour questions,? answered\b", re.I)
 PREVIEW_OVERRIDE = re.compile(r"\b(crash\w*|plunge\w*|tumble\w*|record high|all[- ]time high|halt\w*|circuit breaker|emergency)\b", re.I)
@@ -750,6 +756,8 @@ NEWS_EVENT = re.compile(
     r"\bpartners?\b|\bpartnership\b|\binvests?\b|\bdelist|\blists\b|\bfreez|\bseiz|\bdies\b|\bdead\b|\bkilled\b|"
     r"\bshutdown\b|\bexpected\b|\bexpectations\b|\breports?\b|\bstatement\b|\bminutes\b|\bdecision\b|"
     r"\burges?\b|\bstockpil|\borders?\b|\bto pay\b|\brolls? out\b|"
+    # WG-speed audit 2026-10-28: "Supreme Court recognizes Bitcoin as legal property", "offers buyouts to 60,000", "Google to preview ... system"
+    r"\brecogni[sz](es|ed)\b|\blegal (tender|property)\b|\blegali[sz](es|ed)\b|\bbuyouts?\b|\bto preview\b|\bpreviews\b(?= (a|an|its|new)\b)|"
     # 2026-10-26 world-politics events
     r"\bconcedes?\b|\bconceded\b|\bdefeat(s|ed)?\b|\bwins?\b|\bwon\b|\bre-?elected\b|\belected\b|\bsworn in\b|"
     r"\bdied\b|\bpasses away\b|\bimpeach|\bousted\b|\btopples?\b|\boverthrow|\bcoup\b|\bassassinat|"
@@ -809,6 +817,7 @@ TRUSTED_PUBLISHERS = re.compile(
     r"techcrunch|the verge|wired|ars technica|the information|engadget|cnet|zdnet|"
     r"u\.s\. department of the treasury|treasury|bureau of labor statistics|bls|federal reserve|"
     r"sec\.gov|ripple|the white house|whitehouse\.gov|anthropic|openai|x\.ai|google|venturebeat|"
+    r"crypto briefing|cryptoslate|the cryptonomist|tipranks|"
     r"investopedia|kiplinger|morningstar|investing\.com|fxstreet|kitco|deutsche welle|dw|france 24|"
     r"times of india|the times|the telegraph|sky news|euronews|cbc|globe and mail|abc \(australia\))", re.I)
 OFFICIAL_RELEVANT = {
@@ -1365,12 +1374,112 @@ def post_webhook(cfg: dict, payload: dict) -> bool:
     try:
         with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
             log.info("webhook POST -> %s", r.status)
-            return 200 <= r.status < 300
+            ok = 200 <= r.status < 300
+            _WEBHOOK_LAST["ok" if ok else "fail"] = now_ts()
+            return ok
     except urllib.error.HTTPError as e:
         log.warning("webhook HTTP %s: %s", e.code, e.read(300))
     except Exception as e:
         log.warning("webhook error: %s", e)
+    _WEBHOOK_LAST["fail"] = now_ts()
     return False
+
+# ------------------------------------------------------------------ box/GHA dedupe (WG speed pass 2026-10-28)
+# Both copies used to escalate the same story (~half of all breaking runs were duplicates). Now the box copy
+# publishes a small heartbeat (no secrets) to the orphan branch "heartbeat" of HB_REPO every HB_EVERY_S; the GHA
+# copy stays on standby (polls, marks seen, sends nothing) while that heartbeat is fresh, and takes over at once
+# when it goes stale, can't be read, or the box reports a failing webhook (fail-open).
+HB_REPO = os.environ.get("HERALD_HB_REPO", "IamJhmpologoma/herald-watcher")
+HB_EVERY_S = 90
+HB_STALE_S = 300
+_WEBHOOK_LAST = {"ok": 0.0, "fail": 0.0}
+_HB_CACHE = {"t": 0.0, "alive": False, "why": ""}
+
+
+def _hb_payload(st: dict) -> dict:
+    t = now_ts()
+    lc = st.get("last_cycle", {})
+    ok = sum(1 for v in st.get("feed_health", {}).values() if v.get("ok"))
+    return {"instance": INSTANCE, "t": round(t), "eat": eat(t), "last_cycle_t": round(lc.get("t", 0)),
+            "feeds_ok": ok, "feeds": len(st.get("feed_health", {})),
+            "escalations_today": st.get("escalations", {}).get("count", 0),
+            "webhook_last_ok": round(_WEBHOOK_LAST["ok"]), "webhook_last_fail": round(_WEBHOOK_LAST["fail"])}
+
+
+def _gh_api(args: list[str], body: dict | None = None) -> dict | None:
+    import subprocess
+    cmd = ["gh", "api", *args]
+    if body is not None:
+        cmd += ["--input", "-"]
+    r = subprocess.run(cmd, input=json.dumps(body) if body is not None else None, capture_output=True,
+                       text=True, timeout=30)
+    if r.returncode != 0:
+        raise RuntimeError((r.stderr or r.stdout)[:200])
+    return json.loads(r.stdout) if r.stdout.strip() else {}
+
+
+def heartbeat_once(st: dict):
+    """Box only: parentless commit with box.json, force-moved onto refs/heads/heartbeat (keeps the branch 1 commit)."""
+    content = json.dumps(_hb_payload(st), indent=1)
+    tree = _gh_api([f"repos/{HB_REPO}/git/trees", "-X", "POST"],
+                   {"tree": [{"path": "box.json", "mode": "100644", "type": "blob", "content": content}]})
+    com = _gh_api([f"repos/{HB_REPO}/git/commits", "-X", "POST"],
+                  {"message": "box heartbeat " + eat(), "tree": tree["sha"], "parents": []})
+    try:
+        _gh_api([f"repos/{HB_REPO}/git/refs/heads/heartbeat", "-X", "PATCH"], {"sha": com["sha"], "force": True})
+    except RuntimeError:
+        _gh_api([f"repos/{HB_REPO}/git/refs", "-X", "POST"], {"ref": "refs/heads/heartbeat", "sha": com["sha"]})
+
+
+def heartbeat_thread(st: dict):
+    import threading
+
+    def run():
+        fails = 0
+        while not _stop:
+            lc_t = st.get("last_cycle", {}).get("t", 0)
+            if now_ts() - lc_t < 120:            # only claim "alive" while the poll loop really is cycling
+                try:
+                    heartbeat_once(st)
+                    if fails:
+                        log.info("heartbeat ok again after %d failure(s)", fails)
+                    fails = 0
+                except Exception as e:
+                    fails += 1
+                    if fails in (1, 5) or fails % 40 == 0:
+                        log.warning("heartbeat failed (%d): %s", fails, str(e)[:160])
+            for _ in range(HB_EVERY_S):
+                if _stop:
+                    break
+                time.sleep(1)
+    threading.Thread(target=run, name="heartbeat", daemon=True).start()
+    log.info("heartbeat -> %s@heartbeat every %ss (GHA copy stands by while fresh < %ss)", HB_REPO, HB_EVERY_S, HB_STALE_S)
+
+
+def box_alive() -> tuple[bool, str]:
+    """GHA copy: is the box watcher alive and escalating? Cached 60 s. Fail-open (False) on any read error."""
+    t = now_ts()
+    if t - _HB_CACHE["t"] < 60:
+        return _HB_CACHE["alive"], _HB_CACHE["why"]
+    alive, why = False, ""
+    try:
+        hdr = {"Accept": "application/vnd.github.raw+json", "User-Agent": UA, "Cache-Control": "no-cache"}
+        tok = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+        if tok:
+            hdr["Authorization"] = "Bearer " + tok
+        url = f"https://api.github.com/repos/{HB_REPO}/contents/box.json?ref=heartbeat&_={int(t)}"
+        with urllib.request.urlopen(urllib.request.Request(url, headers=hdr), timeout=10) as r:
+            hb = json.loads(r.read())
+        age = t - hb.get("t", 0)
+        cyc = t - hb.get("last_cycle_t", 0)
+        bad_hook = hb.get("webhook_last_fail", 0) > hb.get("webhook_last_ok", 0) and t - hb.get("webhook_last_fail", 0) < 900
+        alive = age < HB_STALE_S and cyc < HB_STALE_S + 120 and not bad_hook
+        why = f"heartbeat {round(age)}s old, box cycle {round(cyc)}s ago" + (", box webhook failing" if bad_hook else "")
+    except Exception as e:
+        why = f"heartbeat unreadable ({str(e)[:80]})"
+    _HB_CACHE.update(t=t, alive=alive, why=why)
+    return alive, why
+
 
 def is_urgent(h: dict) -> bool:
     """Sent at once, on its own: wire/official fast-lane hits (priority) and any very strong non-lead hit."""
@@ -1390,6 +1499,19 @@ def maybe_escalate(st: dict, dry: bool):
     pend[:] = [h for h in pend if (t - h.get("published_ts", t)) / 60 <= MAX_AGE_MIN]
     if not pend:
         return
+    if INSTANCE != "box" and not dry:
+        alive, why = box_alive()
+        st.setdefault("_standby", {})
+        if alive:
+            if not st["_standby"].get("on"):
+                log.info("standby: box watcher alive (%s); not escalating", why)
+            st["_standby"] = {"on": True, "dropped": st["_standby"].get("dropped", 0) + len(pend)}
+            log.info("standby: dropped %d hit(s) the box copy will handle", len(pend))
+            st["pending_escalation"] = []
+            return
+        if st["_standby"].get("on"):
+            log.info("TAKEOVER: %s; escalating from this copy", why)
+        st["_standby"] = {"on": False, "dropped": st["_standby"].get("dropped", 0)}
     cfg = load_webhook_cfg()
     if not cfg.get("HERALD_WEBHOOK_URL"):
         if not st.get("_warned_no_webhook_day") == dt.date.today().isoformat():
@@ -1513,7 +1635,14 @@ HEADLINE_FLOOR = re.compile(
     r"|\b(binance|coinbase|kraken|ripple|tether|circle|okx|bybit|robinhood|gemini|crypto\.com)\b.{0,40}\b(files for|applies for|wins|secures|"
     r"granted|obtains|receives|gets)\b.{0,30}\b(licen[cs]e|charter|approval|registration)"
     r"|\b(ripple|xrp|stellar|xlm)\b.{0,40}\b(partners? with|partnership with|strikes deal|deal with|teams up)\b"
-    r"|\b(trump|white house)\b.{0,60}\b(bans?|banning|executive order)\b.{0,50}\b(ai|artificial intelligence|crypto|bitcoin|stablecoins?|chips?)\b",
+    r"|\b(trump|white house)\b.{0,60}\b(bans?|banning|executive order)\b.{0,50}\b(ai|artificial intelligence|crypto|bitcoin|stablecoins?|chips?)\b"
+    # WG-speed audit 2026-10-28: megacap/TradFi giant x crypto product; courts/states recognising bitcoin; mass buyouts
+    r"|\b(google|alphabet|apple|microsoft|amazon|meta|blackrock|jpmorgan|visa|mastercard|paypal|stripe|fidelity|nasdaq|goldman)\b.{0,60}"
+    r"\b(launch\w*|unveil\w*|previews?|to preview|rolls? out|introduc\w*|enters?|files?|buys?|bought)\b.{0,60}"
+    r"\b(crypto\w*|bitcoin|btc|stablecoins?|tokeni[sz]ed|digital assets?|custody|blockchain)\b"
+    r"|\b(supreme court|high court|court|parliament|government|central bank)\b.{0,60}\b(recogni[sz]\w*|rules?|declares?|legali[sz]\w*|approves?|bans?)\b"
+    r".{0,40}\b(bitcoin|btc|crypto\w*)\b.{0,30}\b(legal|property|tender|currency|asset)"
+    r"|\b(buyouts?|layoffs?|job cuts)\b.{0,30}\b\d{2,3},?\d{3}\b|\b\d{2,3},?\d{3}\b.{0,30}\b(buyouts?|layoffs?|jobs)\b",
     re.I)
 
 
@@ -1733,6 +1862,8 @@ def main():
     if a.dry_run:
         for k in ("seen_urls", "recent_hits", "http_cache", "stories", "ai_stories", "feed_last_fetch"):
             st[k] = {} if k != "recent_hits" else []
+    if INSTANCE == "box" and not a.once and not a.dry_run and os.environ.get("HERALD_HEARTBEAT", "1") != "0":
+        heartbeat_thread(st)
     n_cycles = 0
     deadline = time.time() + a.run_for if a.run_for and not a.once else 0
     while True:

@@ -33,6 +33,10 @@ jobs:
       HERALD_WEBHOOK_AUTH_HEADER: Authorization
       HERALD_WEBHOOK_AUTH_SCHEME: Bearer
       PYTHONUNBUFFERED: "1"
+      # 2026-10-28 dedupe: stand by while the box copy's heartbeat (branch "heartbeat", box.json) is fresh;
+      # take over automatically when it's stale/unreadable or the box webhook is failing.
+      GITHUB_TOKEN: ${{ github.token }}
+      HERALD_HB_REPO: ${{ github.repository }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
