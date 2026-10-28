@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Herald breaking-news watcher for @JhMpologoma ("Mr Update").
+Herald breaking-news watcher for @UpdateCenterHQ ("Update").
 Since 2026-10-25 ~20:00 EAT: a broad Watcher-Guru-style breaking-news watcher
 (markets, macro, crypto, AI, big tech/business, world headlines). Style guide: ../watcher-guru-style.md
 
@@ -55,7 +55,7 @@ FETCH_WORKERS = 16                  # feeds due in a tick are fetched in paralle
 HOST_BACKOFF_S = (300, 900, 1800)   # 401/403/429/503 from a host: back off that host 5 -> 15 -> 30 min
 MAX_AGE_MIN = 45                    # breaking: drop items published more than 45 min ago
 FIRST_RUN_MAX_AGE_MIN = 45
-UA = "Mozilla/5.0 (X11; Linux x86_64) HeraldWatcher/2.0 (+news monitor for @JhMpologoma)"
+UA = "Mozilla/5.0 (X11; Linux x86_64) HeraldWatcher/2.0 (+news monitor for @UpdateCenterHQ)"
 TIMEOUT = 12
 
 # ---- topic switches (2026-10-25 ~20:00 EAT: everything on again; env can still turn parts off)
@@ -1552,7 +1552,7 @@ def maybe_escalate(st: dict, dry: bool):
             h["dispatch_lag_s"] = round(t - h["detected_ts"])
     payload = {
         "event": "herald_breaking_news",
-        "account": "@JhMpologoma",
+        "account": "@UpdateCenterHQ",
         "ts_eat": eat(t),
         "count": len(send),
         "priority": any(h.get("priority") for h in send),

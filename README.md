@@ -1,5 +1,5 @@
 # herald-watcher
-Free, keyword-based breaking-news watcher (RSS/Google News/price feeds) for @JhMpologoma.
+Free, keyword-based breaking-news watcher (RSS/Google News/price feeds) for @UpdateCenterHQ.
 Runs every 5 minutes on GitHub Actions (`.github/workflows/herald-watcher.yml`) and sends qualifying
 headlines to a private webhook. No AI calls, no secrets in the code.
 
