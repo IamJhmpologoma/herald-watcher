@@ -65,7 +65,8 @@ NEWS_ENABLED = os.environ.get("HERALD_NEWS", "1") == "1"
 
 # ---- webhook limits (breaking-news level)
 ESC_MIN_GAP_S = 5 * 60              # normal batches: at most one every 5 min (scoring pass; latency pass had 3, before that 8)
-ESC_MAX_PER_DAY = 100               # per EAT day (scoring pass; latency pass had 60, before that 40)
+ESC_MAX_PER_DAY = 140               # per EAT day (speed research 2026-10-28: GHA hit reserve-only at 95/100 ~23:20 EAT and held
+                                    # non-urgent hits 28 min until midnight; was 100, before that 60, 40)
 ESC_RESERVE_FOR_URGENT = 20         # the last 20 of the daily cap are kept for urgent (fast-lane) hits only
 MAX_HITS_PER_WEBHOOK = 6            # several hits batched per webhook, best first
 AI_MAX_HITS_PER_POST = 3            # AI can't crowd out the rest of a batch
@@ -171,9 +172,15 @@ NEWS_FEEDS = [
     ("GN: leaders", gnews('("prime minister" OR president OR king OR pope) (resigns OR "steps down" OR dies OR died OR impeached OR ousted OR assassinated OR arrested) when:1h'), "aggregator", 90),
     ("GN: world breaking 2", gnews('(coup OR invasion OR assassination OR earthquake OR tsunami OR "state of emergency" OR "martial law" OR ceasefire) when:1h'), "aggregator", 90),
     ("GN: Africa", gnews('(Uganda OR Kenya OR Nigeria OR "South Africa" OR Ethiopia OR Ghana OR Tanzania OR Rwanda) (president OR election OR protest OR central bank OR dies OR coup) when:2h'), "aggregator", 180),
+    # speed research 2026-10-28: IMF Argentina deal posted ~3h late (imf.org RSS is 403 to scripts, not bypassed);
+    # OpenAI-Google chips (The Information/Reuters brief) never hit; Putin-Zelensky invite / Binance Brazil licence missed
+    ("GN: IMF deals", gnews('("staff-level agreement" OR "IMF board" OR "IMF approves" OR "IMF bailout" OR "IMF loan") when:1h'), "aggregator", 120),
+    ("GN: The Information", gnews("site:theinformation.com when:1h"), "reputable", 120),
+    ("GN: leader talks", gnews('(Putin OR Zelensky OR Trump OR "Xi Jinping" OR Netanyahu OR Khamenei) (invites OR "direct talks" OR "to meet" OR summit OR "phone call") when:1h'), "aggregator", 120),
+    ("GN: crypto licences", gnews('(Binance OR Coinbase OR Kraken OR Ripple OR Tether OR Circle OR OKX OR Bybit OR Robinhood) (license OR licence OR charter OR "partnership") when:2h'), "aggregator", 180),
 ]
 # feeds added in the latency pass: their first fetch only marks items seen (no backlog burst)
-LATENCY_NEW_FEEDS = {"Federal Reserve monetary", "White House actions", "ECB press", "Bank of England news", "Bank of Japan",
+LATENCY_NEW_FEEDS = {"GN: IMF deals", "GN: The Information", "GN: leader talks", "GN: crypto licences", "Federal Reserve monetary", "White House actions", "ECB press", "Bank of England news", "Bank of Japan",
                      "Bank of Canada press", "BEA releases", "GN: central banks", "GN: megacap deals",
                      "GN: Reuters business", "GN: Reuters markets",
                      "GN: megacap newsrooms", "GN: megacap press wires", "Yonhap"}
@@ -203,6 +210,7 @@ AI_FEEDS = [
     ("Mistral AI news", "https://mistral.ai/rss.xml", "official"),
     # anthropic.com and x.ai have no RSS (404); Google News site: queries are the fallback
     ("GN: anthropic.com", gnews("site:anthropic.com when:1d"), "official"),
+    # speed research 2026-10-28: direct poll of anthropic.com/sitemap.xml (robots: Allow /) - see check_anthropic_site()
     ("GN: x.ai", gnews("site:x.ai when:1d"), "official"),
     ("TechCrunch AI", "https://techcrunch.com/category/artificial-intelligence/feed/", "reputable"),
     ("The Verge AI", "https://www.theverge.com/rss/ai-artificial-intelligence/index.xml", "reputable"),
@@ -1187,6 +1195,91 @@ def _price_alerts(st: dict, cur: dict, daych: dict, topic: str, names: dict, url
     return hits
 
 
+# ---- speed research 2026-10-28: US national debt record (WatcherGuru posted $40.5T at 23:53 EAT Oct 27, we were
+# 24 min behind). Official Treasury Fiscal Data API (public, no key). New Debt to the Penny rows land ~16:00-17:00 ET.
+DEBT_POLL_S = 300
+DEBT_API = ("https://api.fiscaldata.treasury.gov/services/api/fiscal_service/v2/accounting/od/debt_to_penny"
+            "?sort=-record_date&page%5Bsize%5D=1&fields=record_date,tot_pub_debt_out_amt")
+DEBT_STEP = 0.1e12
+
+
+def check_us_debt(st: dict) -> list[dict]:
+    code, body, _ = http_get(DEBT_API)
+    if code != 200:
+        raise RuntimeError(f"Treasury API HTTP {code}")
+    row = json.loads(body)["data"][0]
+    day, amt = row["record_date"], float(row["tot_pub_debt_out_amt"])
+    ds = st.setdefault("us_debt", {})
+    if not ds:                                   # first run: baseline only
+        ds.update(day=day, max=amt)
+        return []
+    if day == ds.get("day"):
+        return []
+    prev_max = ds.get("max", amt)
+    ds["day"] = day
+    hits = []
+    if amt > prev_max:
+        ds["max"] = amt
+        if int(amt // DEBT_STEP) > int(prev_max // DEBT_STEP):
+            lvl = int(amt // DEBT_STEP) * DEBT_STEP / 1e12
+            t = now_ts()
+            whole = int(amt // 1e12) > int(prev_max // 1e12)
+            hits.append({"kind": "data", "topic": "Macro",
+                         "title": f"US national debt hits new record high of ${amt/1e12:.2f} trillion (passes ${lvl:.1f}T), Treasury data for {day}",
+                         "url": "https://fiscaldata.treasury.gov/datasets/debt-to-the-penny/debt-to-the-penny",
+                         "source": "Treasury Debt to the Penny", "score": 13 if whole else 11, "priority": True,
+                         "why": ["official", "record", f"debt:{amt:.0f}"],
+                         "published_ts": t, "published_eat": eat(t), "age_min": 0, "detect_lag_s": 0, "instance": INSTANCE})
+    return hits
+
+
+# ---- speed research 2026-10-28: anthropic.com has no RSS; its sitemap.xml (robots: Allow /) lists every /news and
+# /research post with lastmod. The S-1 post and the Mithril Medicine acquisition (inside /research/early-progress-
+# drug-development, 23:26 EAT) only reached us via Google News 2.5 h later. New URLs -> og:title/description -> hit.
+ANTHROPIC_POLL_S = 180
+ANTHROPIC_SITEMAP = "https://www.anthropic.com/sitemap.xml"
+
+
+def _og(html_s: str, key: str) -> str:
+    m = (re.search(r'<meta[^>]+(?:property|name)="' + key + r'"[^>]+content="([^"]*)"', html_s)
+         or re.search(r'<meta[^>]+content="([^"]*)"[^>]+(?:property|name)="' + key + '"', html_s))
+    return html.unescape(m.group(1)).strip() if m else ""
+
+
+def check_anthropic_site(st: dict) -> list[dict]:
+    code, body, _ = http_get(ANTHROPIC_SITEMAP)
+    if code != 200:
+        raise RuntimeError(f"anthropic sitemap HTTP {code}")
+    x = body.decode("utf-8", "replace")
+    urls = {u: lm for u, lm in re.findall(r"<loc>(https://www\.anthropic\.com/(?:news|research)/[^<]+)</loc>\s*<lastmod>([^<]+)</lastmod>", x)}
+    a = st.setdefault("anthropic_seen", {})
+    if not a:                                    # first run: baseline only
+        st["anthropic_seen"] = {u: 1 for u in urls}
+        return []
+    hits, t = [], now_ts()
+    for u, lm in urls.items():
+        if u in a:
+            continue
+        a[u] = 1
+        pub = parse_date(lm) or t
+        if t - pub > 6 * 3600:                   # old page newly added to the sitemap
+            continue
+        c2, b2, _ = http_get(u)
+        page = b2.decode("utf-8", "replace") if c2 == 200 else ""
+        title = _og(page, "og:title") or u.rsplit("/", 1)[-1].replace("-", " ")
+        desc = _og(page, "og:description")
+        if desc.startswith("Anthropic is an AI safety and research company"):
+            desc = ""
+        it = {"title": f"Anthropic: {title}", "src": "", "link": u, "summary": desc}
+        sc, why, _ = score_ai("Anthropic site", "official", it)
+        sc = max(sc, FAST_LANE_MIN_SCORE); why = list(why) + ["anthropic-official-new-post"]   # official, 1-3/day: fast lane
+        hits.append({"kind": "official", "topic": "AI", "title": f"Anthropic: {title}" + (f" | {desc[:220]}" if desc else ""),
+                     "url": u, "source": "anthropic.com (official)", "score": sc, "priority": sc >= FAST_LANE_MIN_SCORE,
+                     "why": why, "published_ts": pub, "published_eat": eat(pub), "age_min": round((t - pub) / 60),
+                     "detect_lag_s": round(t - pub), "instance": INSTANCE})
+    return hits
+
+
 def check_crypto_prices(st: dict) -> list[dict]:
     ids = ",".join(CRYPTO_ASSETS.values())
     code, body, _ = http_get(f"https://api.coingecko.com/api/v3/simple/price?ids={ids}&vs_currencies=usd"
@@ -1406,6 +1499,24 @@ def is_fast_lane(name: str, it: dict, score: int) -> bool:
     return bool(FAST_LANE_DOMAINS.search(host))
 
 
+# ---- headline floor (speed research 2026-10-28): headline shapes that are always WatcherGuru-tier but scored 5-8.
+# Replayed misses: "OpenAI plans to buy Google AI chips" (8), "IMF reaches staff-level agreement with Argentina" (8),
+# "Putin invites Zelensky to Moscow" (5), "Binance files for crypto license in Brazil" (6), "Trump ... ban ... AI" (6).
+# Applied only to items the junk filters did not already drop (score > -20), floor = FAST_LANE_MIN_SCORE.
+_BIG_AI = r"(openai|anthropic|xai|google|alphabet|microsoft|meta|apple|amazon|nvidia|amd|broadcom|tsmc|oracle|softbank|tesla|spacex)"
+HEADLINE_FLOOR = re.compile(
+    r"\b" + _BIG_AI + r"\b.{0,50}\b(plans to buy|to buy|buys|will buy|to acquire|acquires|agrees to buy|in talks to (buy|acquire)|"
+    r"signs?|strikes?|inks?)\b.{0,50}(\b" + _BIG_AI + r"\b|\bai chips?\b|\btpus?\b|\bgpus?\b)"
+    r"|\bstaff[- ]level agreement\b|\bimf (board )?(approves|reaches|agrees)\b|\bimf bailout\b"
+    r"|\b(putin|zelensky[iy]?|trump|xi jinping|xi|netanyahu|khamenei|kim jong un)\b.{0,40}\b(invites?|agrees? to meet|will meet|to meet|"
+    r"direct talks|summit with)\b.{0,40}\b(putin|zelensky[iy]?|trump|xi|netanyahu|khamenei|kim|moscow|kyiv|washington|beijing)\b"
+    r"|\b(binance|coinbase|kraken|ripple|tether|circle|okx|bybit|robinhood|gemini|crypto\.com)\b.{0,40}\b(files for|applies for|wins|secures|"
+    r"granted|obtains|receives|gets)\b.{0,30}\b(licen[cs]e|charter|approval|registration)"
+    r"|\b(ripple|xrp|stellar|xlm)\b.{0,40}\b(partners? with|partnership with|strikes deal|deal with|teams up)\b"
+    r"|\b(trump|white house)\b.{0,60}\b(bans?|banning|executive order)\b.{0,50}\b(ai|artificial intelligence|crypto|bitcoin|stablecoins?|chips?)\b",
+    re.I)
+
+
 def poll_feed(name: str, url: str, tier: str, topic: str, st: dict, t: float, first_run: bool, dry: bool,
               raw=None) -> list[dict]:
     seen = st.setdefault("seen_urls", {})
@@ -1474,6 +1585,8 @@ def poll_feed(name: str, url: str, tier: str, topic: str, st: dict, t: float, fi
             rx, floor = OFFICIAL_MAJOR[name]
             if rx.search(clean if topic != "AI" else it["title"]):
                 sc = max(sc, floor); why = list(why) + ["official-major"]
+        if -20 < sc < FAST_LANE_MIN_SCORE and name != FJ_NAME and HEADLINE_FLOOR.search(clean if topic != "AI" else it["title"]):
+            sc = FAST_LANE_MIN_SCORE; why = list(why) + ["headline-floor"]
         if sc < thr:
             continue
         if item_topic == "AI":
@@ -1555,7 +1668,9 @@ def cycle(st: dict, dry: bool, force_all: bool = False) -> list[dict]:
     polled = len(due)
     if PRICE_ALERTS_ENABLED:
         for key, every, fn in (("_crypto_px", CRYPTO_POLL_S, check_crypto_prices),
-                               ("_market_px", MARKET_POLL_S, check_market_prices)):
+                               ("_market_px", MARKET_POLL_S, check_market_prices),
+                               ("_us_debt", DEBT_POLL_S, check_us_debt),
+                               ("_anthropic", ANTHROPIC_POLL_S, check_anthropic_site)):
             if force_all or t - last_fetch.get(key, 0) >= every:
                 last_fetch[key] = t
                 try:
