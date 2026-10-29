@@ -328,6 +328,9 @@ FJ_TOP = re.compile(
     r"\bemergency (rate|meeting|cut)\b|\bdeclares? war\b|\binva(des?|sion)\b|\bcoup\b|\bmartial law\b|\bnuclear (test|strike|attack)\b|"
     r"\b(attacks?|strikes?|missiles?|drones?|bomb\w*|explosions?)\b.{0,50}\b(riyadh|tehran|tel aviv|jerusalem|taipei|beijing|washington|seoul|abu dhabi|dubai|doha|pyongyang)\b|"
     r"\b(strikes?|attacks?)\b.{0,30}\bnuclear (plant|site|facilit\w*)\b", re.I)
+FJ_EARNINGS = re.compile(r"^(alphabet|google|microsoft|amazon|apple|meta( platforms)?|nvidia|tesla|netflix|broadcom|oracle|coinbase|"
+                         r"(micro)?strategy|intel|amd|palantir|robinhood|circle|berkshire( hathaway)?|jpmorgan|visa|walmart|tsmc|samsung|sk hynix)"
+                         r"\b.{0,30}\b(q[1-4]|quarter(ly)?|fy\d{0,4})\b.{0,40}\b(eps|revenue|sales|earnings|net income|cloud|guidance|operating income)\b", re.I)
 FJ_WIRE_ATTRIB = re.compile(r"[:\-–]\s*(reuters|bloomberg|ap|associated press|nikkei|bbc|wsj)\.?\s*$", re.I)
 FJ_ATTRIB_TAIL = re.compile(r"\s*(?::|-|–)\s*(ifx|tass|ria|cctv|state tv|statement|governor|nikkei|axios|reuters|bloomberg|"
                             r"the times|kcna|tasnim|sepah news|govt data|government data|notice|[a-z]{2,12})\.?\s*$", re.I)
@@ -731,7 +734,7 @@ PRESS_WIRES = re.compile(r"pr newswire|prnewswire|business wire|businesswire|glo
 PREVIEW_JUNK = re.compile(
     r"\bexpected to\b|\bexpects?\b|\bforecasts?\b|\bpredicts?\b|\bahead of\b|\bbraces?\b|\bawaits?\b|\bawaiting\b|\blooms?\b|\bodds\b|"
     r"\bon the line\b|\bpre-?bell\b|\bpre-?market\b|\bstock market today\b|\bfutures (rise|fall|edge|climb|slip|dip|gain)|\bearnings call transcript\b|"
-    r"\bmaybe\b|(?<!to )(?<!\bto )\bpreview\b(?!\s+(a|an|its|new|crypto|security|custody)\b)|\bwhat to watch\b|\blooks (beyond|ahead|to)\b|\bsoftens\b|\bpoises\b|\bhovers\b|\bdrifts\b|\bsteadies\b|\bfirms\b|"
+    r"\bmaybe\b|(?<!to )(?<!\bto )\bpreview\b(?!\s+(a|an|its|new|crypto|security|custody)\b)|\bwhat to watch\b|\blooks (beyond|ahead|to)\b|\bsoftens\b|\bpoises\b|\bhovers\b|\bdrifts\b|\bsteadies\b|\b(dollar|yen|euro|pound|sterling|yuan|rupee|gold|oil|yields?|bonds?|index|futures)\s+firms\b|"
     r"\banalysts? (divided|say|see|warn)\b|\bwill (surge|soar|jump|rally|rise|climb|fall|drop|plunge|crash|double|triple)\b|\b(says|according to|per) (morgan stanley|goldman( sachs)?|jpmorgan|bofa|bank of america|citi(group)?|ubs|barclays|bernstein|jefferies|wedbush|analysts?)\s*$|\binvestors weigh\b|\bweighs? (in|up)\b|\breverses? (losses|gains)\b|\baccording to (one|an?) (wall street )?analyst\b|\bto buy (before|now)\b|"
     r"\b(cryptocurrenc(y|ies)|coins?|tokens?|altcoins?|stocks?|shares?)\b.{0,15}\bto buy\b|\bdays away\b|,\s*more$|\bop-?ed\b|^i[’']?m\b|^i\b|^my\b|\bin (maps|charts|pictures)\b|[-–—]\s*(business|markets?|politics|world|news) live\s*$|\blive blog\b|\blatest (news|company updates|updates)\b|\byour questions,? answered\b", re.I)
 PREVIEW_OVERRIDE = re.compile(r"\b(crash\w*|plunge\w*|tumble\w*|record high|all[- ]time high|halt\w*|circuit breaker|emergency)\b", re.I)
@@ -970,6 +973,10 @@ def score_fj(name: str, tier: str, it: dict) -> tuple[int, list[str], str, str]:
         if rule > 0 and (a is None or f is None or abs(a - f) < rule):
             return -30, why + [f"fj:in-line print ({ind})"], title, ""
         return FJ_MIN_SCORE + 1, why + [f"fj:major data {ind} actual {m.group('a')} vs {m.group('f')}", "big:data-surprise"], title, "Macro"
+    if FJ_EARNINGS.search(title) and not PREVIEW_JUNK.search(title):
+        # speed audit 2026-10-29: megacap earnings prints ("Alphabet Q3 Revenue $127.58B vs. Est ...") were dropped as
+        # not headline-worthy; WG posted Alphabet's miss at 23:02, we posted at 23:20 off Google News.
+        return FJ_MIN_SCORE + 2, why + ["fj-earnings", "big:megacap-earnings"], title, "Markets"
     core = FJ_ATTRIB_TAIL.sub("", title)     # drop trailing attribution (": governor", "- RIA", ": Nikkei")
     body = core
     sp = FJ_SPEAKER.match(core)
@@ -1286,6 +1293,59 @@ def check_anthropic_site(st: dict) -> list[dict]:
                      "url": u, "source": "anthropic.com (official)", "score": sc, "priority": sc >= FAST_LANE_MIN_SCORE,
                      "why": why, "published_ts": pub, "published_eat": eat(pub), "age_min": round((t - pub) / 60),
                      "detect_lag_s": round(t - pub), "instance": INSTANCE})
+    return hits
+
+
+# ---- speed audit 2026-10-29: SEC EDGAR "latest filings" 8-K Atom feed. Alphabet's Q3 8-K (Item 2.02) was accepted
+# 16:01:33 ET = 23:01:33 EAT; WG posted 23:02, we posted 23:20 off Google News. Public, free; SEC fair-access policy
+# requires a User-Agent naming the operator with a contact email, so the check stays OFF until HERALD_SEC_CONTACT is set.
+SEC_CONTACT = os.environ.get("HERALD_SEC_CONTACT", "").strip()
+EDGAR_POLL_S = 20
+EDGAR_URL = "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=8-K&count=100&output=atom"
+EDGAR_WATCH = re.compile(r"^8-K(/A)? - (alphabet inc|microsoft corp|amazon com inc|apple inc|meta platforms|nvidia corp|tesla, inc|"
+                         r"netflix inc|broadcom inc|oracle corp|coinbase global|strategy inc|microstrategy|intel corp|advanced micro devices|"
+                         r"palantir technologies|robinhood markets|circle internet|berkshire hathaway inc|jpmorgan chase|visa inc|walmart inc|"
+                         r"starbucks corp|exxon mobil|eli lilly|boeing co|blackrock|block, inc|galaxy digital|mara holdings|riot platforms|"
+                         r"openai|anthropic|spacex|space exploration)", re.I)
+EDGAR_ITEMS = {"2.02": (12, "results (earnings release)"), "1.03": (12, "bankruptcy/receivership"),
+               "2.01": (11, "completed acquisition/disposal"), "1.01": (10, "material agreement"),
+               "5.02": (10, "director/officer change"), "4.02": (11, "non-reliance on prior financials")}
+
+
+def check_edgar_8k(st: dict) -> list[dict]:
+    if not SEC_CONTACT:
+        return []
+    code, body, _ = http_get(EDGAR_URL, {"User-Agent": f"HeraldWatcher/2.0 {SEC_CONTACT}"})
+    if code != 200:
+        raise RuntimeError(f"EDGAR HTTP {code}")
+    x = body.decode("latin-1", "replace")
+    seen = st.setdefault("edgar_seen", {})
+    first = not seen
+    hits, t = [], now_ts()
+    for e in re.findall(r"<entry>(.*?)</entry>", x, re.S):
+        acc = re.search(r"accession-number=([\d-]+)", e)
+        if not acc or acc.group(1) in seen:
+            continue
+        seen[acc.group(1)] = t
+        title = html.unescape(re.search(r"<title>(.*?)</title>", e, re.S).group(1)).strip()
+        if first or not EDGAR_WATCH.search(title):
+            continue
+        summ = html.unescape(re.search(r"<summary[^>]*>(.*?)</summary>", e, re.S).group(1))
+        items = re.findall(r"Item (\d\.\d\d)", summ)
+        best = max((EDGAR_ITEMS[i] for i in items if i in EDGAR_ITEMS), default=None)
+        if not best:
+            continue
+        link = re.search(r'href="([^"]+)"', e).group(1)
+        upd = parse_date(re.search(r"<updated>(.*?)</updated>", e).group(1)) or t
+        co = re.sub(r"\s*\(\d{10}\).*$", "", title.split(" - ", 1)[1]).strip()
+        sc, what = best
+        hits.append({"kind": "official", "topic": "Markets",
+                     "title": f"SEC 8-K: {co} files {what} (Items {', '.join(items)}). Open the filing's EX-99.1 for the numbers",
+                     "url": link, "source": "SEC EDGAR 8-K (official)", "score": sc, "priority": True,
+                     "why": ["official", "sec-8k"] + [f"item:{i}" for i in items],
+                     "published_ts": upd, "published_eat": eat(upd), "age_min": round((t - upd) / 60),
+                     "detect_lag_s": round(t - upd), "instance": INSTANCE})
+    st["edgar_seen"] = {k: v for k, v in seen.items() if t - v < 3 * 86400}
     return hits
 
 
@@ -1642,7 +1702,19 @@ HEADLINE_FLOOR = re.compile(
     r"\b(crypto\w*|bitcoin|btc|stablecoins?|tokeni[sz]ed|digital assets?|custody|blockchain)\b"
     r"|\b(supreme court|high court|court|parliament|government|central bank)\b.{0,60}\b(recogni[sz]\w*|rules?|declares?|legali[sz]\w*|approves?|bans?)\b"
     r".{0,40}\b(bitcoin|btc|crypto\w*)\b.{0,30}\b(legal|property|tender|currency|asset)"
-    r"|\b(buyouts?|layoffs?|job cuts)\b.{0,30}\b\d{2,3},?\d{3}\b|\b\d{2,3},?\d{3}\b.{0,30}\b(buyouts?|layoffs?|jobs)\b",
+    r"|\b(buyouts?|layoffs?|job cuts)\b.{0,30}\b\d{2,3},?\d{3}\b|\b\d{2,3},?\d{3}\b.{0,30}\b(buyouts?|layoffs?|jobs)\b"
+    # speed audit 2026-10-29: big bank x crypto (Itau, WG 17:28, CoinDesk title scored 8); central-bank chief quotes on
+    # inflation/rates (Warsh "inflation too high", WG 21:38); head of state on a megacap billionaire (Putin/Musk, WG 16:48);
+    # billionaire tax flight (Notch, WG 02:04); opposition to stock tokenization (33 companies, WG 15:42)
+    r"|\b(ita[uú]( unibanco)?|santander|hsbc|barclays|ubs|citi(group)?|bank of america|wells fargo|morgan stanley|bny( mellon)?|state street|"
+    r"deutsche bank|bnp( paribas)?|nubank|standard chartered|(largest|biggest|top|first) (private )?(bank|lender))\b.{0,60}"
+    r"\b(launch\w*|offer\w*|formali[sz]\w*|starts?|begins?|rolls? out|enters?|files? to|to launch|debuts?)\b.{0,40}"
+    r"\b(crypto\w*|bitcoin|btc|stablecoins?|custody|tokeni[sz]\w*)\b"
+    r"|\b(fed chair|powell|warsh|lagarde|ueda|bailey)\b.{0,30}\b(says|warns|signals)\b.{0,50}\b(inflation|rate hikes?|rate cuts?|hikes?|cuts?|recession)\b"
+    r"|\b(putin|xi jinping|trump|modi|erdogan|macron|zelensky[iy]?|netanyahu|milei)\b.{0,30}\b(says|calls|praises|slams|attacks)\b.{0,40}"
+    r"\b(musk|bezos|zuckerberg|altman|jensen huang|saylor|buffett|bill gates)\b"
+    r"|\b(billionaires?|founder|creator)\b.{0,60}\b(flees|leaves|quits|exits|moves out of)\b.{0,20}\b(california|new york|the uk|britain|france|norway)\b"
+    r"|\b(oppos\w*|object\w*|reject\w*)\b.{0,60}\btokeni[sz]\w*|\btokeni[sz]\w*\b.{0,40}\b(oppos\w*|objections?)\b",
     re.I)
 
 
@@ -1740,6 +1812,8 @@ def poll_feed(name: str, url: str, tier: str, topic: str, st: dict, t: float, fi
             "detect_lag_s": round(t - it["date"]), "detected_ts": round(t, 1), "handled": False,
             "priority": is_fast_lane(name, it, sc), "instance": INSTANCE,
         })
+        if name == FJ_NAME and "fj-earnings" in why:
+            hits[-1]["priority"] = True          # send at once; routine confirms at the company IR page / SEC 8-K
         if name == FJ_NAME:
             hits[-1].update(lead_only=True, verify_note="FinancialJuice squawk = lead only. Confirm at the primary "
                             "source (company/central bank/government/wire) and cite that, never FinancialJuice.")
@@ -1799,7 +1873,8 @@ def cycle(st: dict, dry: bool, force_all: bool = False) -> list[dict]:
         for key, every, fn in (("_crypto_px", CRYPTO_POLL_S, check_crypto_prices),
                                ("_market_px", MARKET_POLL_S, check_market_prices),
                                ("_us_debt", DEBT_POLL_S, check_us_debt),
-                               ("_anthropic", ANTHROPIC_POLL_S, check_anthropic_site)):
+                               ("_anthropic", ANTHROPIC_POLL_S, check_anthropic_site),
+                               ("_edgar", EDGAR_POLL_S, check_edgar_8k)):
             if force_all or t - last_fetch.get(key, 0) >= every:
                 last_fetch[key] = t
                 try:
