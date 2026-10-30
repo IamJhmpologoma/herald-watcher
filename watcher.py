@@ -95,7 +95,7 @@ FAST_LANE_PUBLISHERS = re.compile(r"^(reuters|associated press|ap news|bloomberg
                                   r"cnbc|the wall street journal|wsj|financial times|"
                                   r"the white house|federal reserve|u\.s\. department of the treasury|bureau of labor statistics)\b", re.I)
 FAST_LANE_FEEDS = re.compile(r"^(Reuters|BBC|Nikkei|CNBC|WSJ|MarketWatch Bulletins|Federal Reserve|SEC press|White House|ECB|Bank of (England|Japan|Canada)|BEA|"
-                             r"Yonhap|GN: (Reuters|AP|Bloomberg|treasury\.gov|bls\.gov))", re.I)   # Yonhap added 2026-10-30 (NK missiles)
+                             r"Yonhap|AP Bluesky|GN: (Reuters|AP|Bloomberg|treasury\.gov|bls\.gov))", re.I)   # Yonhap added 2026-10-30 (NK missiles)
 AI_STORY_DEDUPE_S = 12 * 3600
 
 def gnews(q: str) -> str:
@@ -165,10 +165,14 @@ NEWS_FEEDS = [
                                       "(Meta OR Apple OR Microsoft OR Nvidia OR Amazon OR Alphabet OR Tesla OR Broadcom OR Oracle OR Netflix OR JPMorgan) when:1d"), "official", 120),
     # ---- speed fixes 2026-10-26: direct wires + world/politics (all curl-checked 2026-10-26 ~09:00 EAT)
     ("BBC Top Stories", "https://feeds.bbci.co.uk/news/rss.xml", "reputable", 30),
+    ("AP Bluesky", "https://bsky.app/profile/apnews.com/rss", "reputable", 30),
     ("BBC Africa", "https://feeds.bbci.co.uk/news/world/africa/rss.xml", "reputable", 180),
     ("Nikkei Asia", "https://asia.nikkei.com/rss/feed/nar", "reputable", 90),       # undated items: first-seen time used
     ("Japan Times", "https://www.japantimes.co.jp/feed/", "reputable", 180),
-    ("Yonhap", "https://en.yna.co.kr/RSS/news.xml", "reputable", 120),   # speed research 2026-10-27: Korea markets/N. Korea first-hand
+    ("Yonhap", "https://en.yna.co.kr/RSS/news.xml", "reputable", 60),    # 2026-10-30: was 120 (NK missiles: URGENT seen 07:39, posted 08:46)
+    # speed research 2026-10-30: AP's own public Bluesky RSS (official bsky.app profile feed, no login/key). Its "BREAKING:"
+    # posts led AP's X post and every RSS we poll: Patrick Stewart 22:59:16 EAT (BBC X 23:00, AP X 23:02, we 23:13),
+    # DoorDash-Instacart 15:27:18. Only BREAKING posts are scored (features/explainers dropped in _clean_title).   # speed research 2026-10-27: Korea markets/N. Korea first-hand
     ("Guardian World", "https://www.theguardian.com/world/rss", "reputable", 90),
     ("DW", "https://rss.dw.com/rdf/rss-en-all", "reputable", 120),
     ("France 24", "https://www.france24.com/en/rss", "reputable", 120),
@@ -190,7 +194,7 @@ NEWS_FEEDS = [
 LATENCY_NEW_FEEDS = {"GN: big tech x crypto", "GN: crypto law/courts", "GN: IMF deals", "GN: The Information", "GN: leader talks", "GN: crypto licences", "Federal Reserve monetary", "White House actions", "ECB press", "Bank of England news", "Bank of Japan",
                      "Bank of Canada press", "BEA releases", "GN: central banks", "GN: megacap deals",
                      "GN: Reuters business", "GN: Reuters markets",
-                     "GN: megacap newsrooms", "GN: megacap press wires", "Yonhap"}
+                     "GN: megacap newsrooms", "GN: megacap press wires", "Yonhap", "AP Bluesky"}
 
 CRYPTO_FEEDS = [
     ("CoinDesk", "https://www.coindesk.com/arc/outboundfeeds/rss/", "reputable", 45),
@@ -588,6 +592,11 @@ def parse_feed(data: bytes) -> list[dict]:
                 it["summary"] = strip_tags(c.text or "")[:500]
             elif n == "source":
                 it["src"] = (c.text or "").strip()
+        if not it["title"] and it["summary"] and "bsky.app/" in it["link"]:
+            # Bluesky profile RSS has no <title>: use the post text minus links (2026-10-30)
+            txt = re.sub(r"https?://\S+|\b(bit\.ly|reut\.rs|apne\.ws)/\S+", "", it["summary"]).strip()
+            first = re.split(r"(?<=[a-z0-9\"')][.!?])\s", txt, 1)[0].strip()   # headline = first sentence
+            it["title"] = (first if len(first) >= 40 else txt)[:220]
         if it["title"]:
             items.append(it)
     # Google News sitemap (Reuters): <url><loc/><news:news><news:publication_date/><news:title/></news:news></url>
@@ -902,6 +911,8 @@ def _clean_title(name: str, it: dict) -> str:
             title = title[: -(len(gsrc) + 3)]
         else:
             title = re.sub(r"\s+-\s+[^-]{2,40}$", "", title)
+    if name == "AP Bluesky":   # only AP's BREAKING posts; everything else is a feature/explainer
+        title = re.sub(r"^BREAKING:\s*", "", title) if re.match(r"^BREAKING:", title) else "Opinion: " + title
     if name == "Yonhap":   # strip wire version tags so (URGENT)/(LEAD)/(2nd LD) copies dedupe; mark features as opinion
         title = re.sub(r"^\((EDITORIAL|News Focus|Yonhap Feature|Yonhap Interview|Feature|Interview|Column)\)\s*", "Opinion: ", title, flags=re.I)
         title = re.sub(r"^\((URGENT|LEAD|\d+(st|nd|rd|th) LD|Yonhap Exclusive)\)\s*", "", title, flags=re.I)
