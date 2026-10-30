@@ -189,25 +189,9 @@ NEWS_FEEDS = [
     ("GN: The Information", gnews("site:theinformation.com when:1h"), "reputable", 120),
     ("GN: leader talks", gnews('(Putin OR Zelensky OR Trump OR "Xi Jinping" OR Netanyahu OR Khamenei) (invites OR "direct talks" OR "to meet" OR summit OR "phone call") when:1h'), "aggregator", 120),
     ("GN: crypto licences", gnews('(Binance OR Coinbase OR Kraken OR Ripple OR Tether OR Circle OR OKX OR Bybit OR Robinhood) (license OR licence OR charter OR "partnership") when:2h'), "aggregator", 180),
-    # ---- 2026-10-30 Africa/EM niche (growth plan v2). Direct feeds curl-checked 16:35 EAT (200, fresh items);
-    # BoU/CBN/SARB/UBOS/KNBS have no working RSS (404/empty/timeout) and Monitor/Nation/EastAfrican return 403 -> Google News site: fallbacks.
-    ("CBK news", "https://www.centralbank.go.ke/feed/", "official", 300),
-    ("Nairametrics", "https://nairametrics.com/feed/", "reputable", 180),
-    ("BusinessDay NG", "https://businessday.ng/feed/", "reputable", 240),
-    ("Moneyweb", "https://www.moneyweb.co.za/feed/", "reputable", 240),
-    ("TechCabal", "https://techcabal.com/feed/", "reputable", 300),
-    ("African Business", "https://african.business/feed", "reputable", 600),
-    ("GN: Africa central banks", gnews('("Bank of Uganda" OR "Central Bank of Kenya" OR "Central Bank of Nigeria" OR "Reserve Bank" OR "Bank of Ghana" OR "Bank of Tanzania" OR "National Bank of Rwanda" OR "Bank of Zambia" OR MPC OR "central bank rate") (rate OR MPC OR holds OR cuts OR raises) when:2h'), "aggregator", 120),
-    ("GN: Africa FX/debt", gnews('(shilling OR naira OR cedi OR rand OR kwacha OR birr OR Eurobond OR IMF) (Uganda OR Kenya OR Nigeria OR Ghana OR "South Africa" OR Zambia OR Ethiopia OR Egypt OR Tanzania) when:2h'), "aggregator", 150),
-    ("GN: Reuters Africa", gnews("site:reuters.com/world/africa when:2h"), "reputable", 90),
-    ("GN: Bloomberg Africa", gnews("site:bloomberg.com (Africa OR Nigeria OR Kenya OR Uganda OR Ghana OR \"South Africa\") when:2h"), "reputable", 120),
-    ("GN: Daily Monitor", gnews("site:monitor.co.ug when:2h"), "reputable", 180),
-    ("GN: The EastAfrican", gnews("site:theeastafrican.co.ke when:2h"), "reputable", 240),
-    ("GN: Business Daily", gnews("site:businessdailyafrica.com when:2h"), "reputable", 240),
-    ("GN: Nation Africa business", gnews("site:nation.africa business when:2h"), "reputable", 300),
 ]
 # feeds added in the latency pass: their first fetch only marks items seen (no backlog burst)
-LATENCY_NEW_FEEDS = {"CBK news", "Nairametrics", "BusinessDay NG", "Moneyweb", "TechCabal", "African Business", "GN: Africa central banks", "GN: Africa FX/debt", "GN: Reuters Africa", "GN: Bloomberg Africa", "GN: Daily Monitor", "GN: The EastAfrican", "GN: Business Daily", "GN: Nation Africa business", "GN: big tech x crypto", "GN: crypto law/courts", "GN: IMF deals", "GN: The Information", "GN: leader talks", "GN: crypto licences", "Federal Reserve monetary", "White House actions", "ECB press", "Bank of England news", "Bank of Japan",
+LATENCY_NEW_FEEDS = {"GN: big tech x crypto", "GN: crypto law/courts", "GN: IMF deals", "GN: The Information", "GN: leader talks", "GN: crypto licences", "Federal Reserve monetary", "White House actions", "ECB press", "Bank of England news", "Bank of Japan",
                      "Bank of Canada press", "BEA releases", "GN: central banks", "GN: megacap deals",
                      "GN: Reuters business", "GN: Reuters markets",
                      "GN: megacap newsrooms", "GN: megacap press wires", "Yonhap", "AP Bluesky"}
@@ -803,14 +787,9 @@ ANALYST_NOTE = re.compile(r"^(goldman( sachs)?|morgan stanley|jpmorgan|j\.p\. mo
 # Non-megacap quarterly results are not breaking news for us
 SMALL_EARNINGS = re.compile(r"\b(q[1-4]|quarterly|first-quarter|second-quarter|third-quarter|fourth-quarter|half-year|annual)\b.{0,25}\b(profit|revenue|earnings|net income|loss)\b|"
                             r"\b(profit|net income|revenue)\b.{0,10}\b(falls|rises|jumps|drops|slumps|surges|climbs|declines)\b", re.I)
-ENT_WEIGHT = {"crypto": 4, "macro": 4, "markets": 3, "bigco": 3, "people": 3, "politics": 3, "crisis": 3, "africa": 3, "world": 2}
-# 2026-10-30 Africa/EM niche (growth plan v2): Africa entity group
-ENT["africa"] = re.compile(r"\buganda(n)?\b|\bkenya(n)?\b|\bnigeria(n)?\b|south africa(n)?|\bghana(ian)?\b|\btanzania(n)?\b|\brwanda(n)?\b|\bethiopia(n)?\b|\bzambia(n)?\b|\begypt(ian)?\b|"
-    r"\bshillings?\b|\bnaira\b|\bcedis?\b|\brand\b(?= |$)|\bkwacha\b|\bbirr\b|bank of uganda|\bbou\b|central bank of (kenya|nigeria)|\bcbk\b|\bcbn\b|\bsarb\b|reserve bank of south africa|south african reserve bank|bank of ghana|"
-    r"\beurobonds?\b|\bmtn\b|\bairtel\b|\bsafaricom\b|m-pesa|\bdangote\b|\bnse\b(?=.{0,30}(nairobi|kenya))|\bjse\b|\bafreximbank\b|african development bank|\bafdb\b", re.I)
+ENT_WEIGHT = {"crypto": 4, "macro": 4, "markets": 3, "bigco": 3, "people": 3, "politics": 3, "crisis": 3, "world": 2}
 
 NEWS_EVENT = re.compile(
-    r"\bmpc\b|\bcbr\b|central bank rate|policy rate|\beurobond|\bimf (deal|loan|board|programme|program|approv)|\bdevalu|record low|\bdefault|"
     r"\bannounc|\bsigns?\b|\bsigned\b|executive order|\bimpos|\bsanction|\bbans?\b|\bbanned\b|"
     r"\bapprov|\brejects?\b|\blaunch(es|ed)?\b|\bunveil|\bcuts?\b|\bhikes?\b|\braises?\b|\bholds?\b(?= rates| interest)|"
     r"record high|all[- ]time high|\brecord\b|\bcrash|\bplung|\btumbl|\bsoar|\bsurg|\bjumps?\b|\bdump|\bsinks?\b|\bslump|"
@@ -886,10 +865,8 @@ TRUSTED_PUBLISHERS = re.compile(
     r"sec\.gov|ripple|the white house|whitehouse\.gov|anthropic|openai|x\.ai|google|venturebeat|"
     r"crypto briefing|cryptoslate|the cryptonomist|tipranks|"
     r"investopedia|kiplinger|morningstar|investing\.com|fxstreet|kitco|deutsche welle|dw|france 24|"
-    r"daily monitor|the eastafrican|business daily africa|business daily|daily nation|nation africa|nairametrics|businessday|business day|techcabal|moneyweb|daily maverick|premium times|african business|the citizen|new vision|the standard|punch|vanguard|news24|central bank of kenya|bank of uganda|"
     r"times of india|the times|the telegraph|sky news|euronews|cbc|globe and mail|abc \(australia\))", re.I)
 OFFICIAL_RELEVANT = {
-    "CBK news": re.compile(r"monetary policy|mpc|central bank rate|cbr|statement|governor|license|licence|crypto|virtual asset|emergency|receiver", re.I),
     "Federal Reserve": re.compile(r"fomc|monetary policy|federal funds|discount rate|statement|minutes|"
                                   r"crypto|stablecoin|digital asset|enforcement action|stress test|chair", re.I),
     "SEC press releases": re.compile(r"crypto|bitcoin|ether|stablecoin|digital asset|token|etf|charges|"
