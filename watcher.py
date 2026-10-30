@@ -68,6 +68,13 @@ ESC_MIN_GAP_S = 5 * 60              # normal batches: at most one every 5 min (s
 ESC_MAX_PER_DAY = 140               # per EAT day (speed research 2026-10-28: GHA hit reserve-only at 95/100 ~23:20 EAT and held
                                     # non-urgent hits 28 min until midnight; was 100, before that 60, 40)
 ESC_RESERVE_FOR_URGENT = 20         # the last 20 of the daily cap are kept for urgent (fast-lane) hits only
+# speed research 2026-10-30: reserve-only mode began 18:23 EAT on Oct 29 and held every non-urgent hit ~5.5 h (HYPE +13% /
+# NYSE-ICE perps score 12 at 19:13, ETH/XRP/SOL crash cluster 23:44 sent at 00:00 with 682-1743 s lag) while the day
+# ended at 135/140. In reserve mode strong batches (score >= ESC_RESERVE_BATCH_MIN_SCORE) still go every
+# ESC_RESERVE_BATCH_GAP_S until only ESC_HARD_RESERVE_URGENT remain; the daily cap itself is unchanged.
+ESC_RESERVE_BATCH_GAP_S = 15 * 60
+ESC_RESERVE_BATCH_MIN_SCORE = 11
+ESC_HARD_RESERVE_URGENT = 8
 MAX_HITS_PER_WEBHOOK = 6            # several hits batched per webhook, best first
 AI_MAX_HITS_PER_POST = 3            # AI can't crowd out the rest of a batch
 AI_HIT_THRESHOLD = 9
@@ -88,7 +95,7 @@ FAST_LANE_PUBLISHERS = re.compile(r"^(reuters|associated press|ap news|bloomberg
                                   r"cnbc|the wall street journal|wsj|financial times|"
                                   r"the white house|federal reserve|u\.s\. department of the treasury|bureau of labor statistics)\b", re.I)
 FAST_LANE_FEEDS = re.compile(r"^(Reuters|BBC|Nikkei|CNBC|WSJ|MarketWatch Bulletins|Federal Reserve|SEC press|White House|ECB|Bank of (England|Japan|Canada)|BEA|"
-                             r"GN: (Reuters|AP|Bloomberg|treasury\.gov|bls\.gov))", re.I)
+                             r"Yonhap|GN: (Reuters|AP|Bloomberg|treasury\.gov|bls\.gov))", re.I)   # Yonhap added 2026-10-30 (NK missiles)
 AI_STORY_DEDUPE_S = 12 * 3600
 
 def gnews(q: str) -> str:
@@ -312,6 +319,33 @@ FJ_MAJOR = re.compile(
     r"\b(bankrupt\w*|chapter 11|defaults? on)\b|"
     r"\b(trump|white house|u\.?s\.?|china|eu|beijing)\b.{0,40}\b(imposes?|announces?|raises?|slaps?|to impose)\b.{0,30}\b(tariffs?|sanctions|export (ban|controls?))\b|"
     r"\bexecutive order\b.{0,40}\b(signs?|signed)\b|\bsigns?\b.{0,30}\bexecutive order\b", re.I)
+# speed research 2026-10-30: replayed Oct 29 misses that scored 3-7 (shared by HEADLINE_FLOOR and FJ_HEADLINE):
+# ECB "Lagarde to step down" (6, FJ -20), Yonhap/FJ North Korea missiles (5, FJ -20), CoinDesk "NYSE owner ... Hyperliquid
+# perpetual futures" (5), Patrick Stewart "actor ... dies aged 86" (3), CoinDesk "Potential multi-billion Binance hack" (7),
+# FJ "US suspected spy ... AI chips - NYT" (-20) / "close to Nvidia CEO Jensen Huang identified as spy" (7), DoorDash-Instacart
+# $17B (8), Strnad EUR30B offer (3), Russia central bank registers crypto SRO (7), Finland criminal probe of Google (7).
+_FLOOR_1030 = (
+    r"\b(ecb|fed|federal reserve|boj|boe|bank of \w+|central bank|imf|world bank)\b.{0,30}\b(president|chair\w*|governor|chief|head)\b(?:(?!\b(?:not|never|denies|deny|won't|rules? out)\b).){0,40}"
+    r"\b(to step down|steps? down|stepping down|resigns?|to resign|resignation|quits?|fired|ousted|removed)\b"
+    r"|\b(lagarde|powell|warsh|ueda|bailey|georgieva|macklem)\b(?:(?!\b(?:not|never|denies|deny|won't|rules? out)\b).){0,40}\b(to step down|steps? down|stepping down|resigns?|to resign|quits?|fired|ousted)\b"
+    r"|\b(north korea|pyongyang|iran|china)\b.{0,30}\b(fires?|fired|launch(es|ed)?|test[- ]fires?)\b.{0,40}\bmissiles?\b"
+    r"|\b(nyse|intercontinental exchange|nasdaq (inc|exchange|owner)|cme( group)?|cboe|lme|london metal exchange|lseg|london stock exchange|deutsche b[oö]rse|hkex|sgx|dtcc)\b"
+    r".{0,60}\b(perpetual\w*|perps?|tokeni[sz]\w*|tokens?|stablecoins?|hyperliquid|on-?chain|crypto (futures|derivatives|perpetuals|trading|exchange|custody))\b"
+    r"|\b(actor|actress|singer|rapper|musician|star|legend|icon|director|filmmaker|author|novelist|thespian|billionaire|founder|footballer|tycoon|nobel)\b"
+    r".{0,60}\b(dies|has died|dead)\b.{0,12}\b(aged?|at)\s\d{2,3}\b"
+    r"|\b(former|ex-)\s?(us |u\.s\. )?(president|prime minister)\b.{0,50}\b(dies|has died|dead)\b"
+    r"|\b(offers?|bids?|to buy|to acquire|acquires?|agrees? to (buy|acquire)|takeover|buyout)\b.{0,50}[$\u20ac\u00a3]\s?(1\d|[2-9]\d|\d{3,})(\.\d+)?\s?(b|bn|billion)\b"
+    r"|[$\u20ac\u00a3]\s?(1\d|[2-9]\d|\d{3,})(\.\d+)?\s?(bn|billion)\b.{0,40}\b(deal|takeover|offer|bid|acquisition|buyout|merger)\b"
+    r"|\b(binance|coinbase|kraken|okx|bybit|bitget|upbit|hyperliquid|tether|circle)\b.{0,50}\b(hack\w*|exploit\w*|drain\w*|breach\w*|"
+    r"freez\w*|frozen|halts? withdrawals|suspends? withdrawals|withdrawals? (are )?(paused|halted|suspended|resume\w*))\b"
+    r"|\b(hack\w*|exploit\w*)\b.{0,40}\b(binance|coinbase|kraken|okx|bybit|bitget|upbit|hyperliquid)\b"
+    r"|\b(spy|spies|espionage|intelligence asset|chinese asset|chinese agent)\b.{0,80}\b(nvidia|jensen huang|apple|tim cook|musk|tesla|openai|altman|"
+    r"google|microsoft|meta|zuckerberg|tsmc|amd|ai chips?)\b"
+    r"|\b(nvidia|jensen huang|apple|tim cook|musk|openai|altman|zuckerberg|tsmc)\b.{0,60}\b(spy|spies|espionage|chinese asset)\b"
+    r"|\b(central bank|sec|cftc|regulator)\b.{0,40}\b(registers?|approves?|licen[cs]es?|authori[sz]es?|recogni[sz]es?)\b.{0,50}\b(crypto\w*|bitcoin|stablecoins?)\b"
+    r"|[$]\s?\d+(\.\d+)?\s?(b|bn|billion)\b.{0,25}\b(bitcoin|btc|ether|eth)\b.{0,25}\b(treasury|strategy|purchase|buy|investment|fund)\b"
+    r"|\b(criminal (investigation|probe)|raids?|raided)\b.{0,30}\b(google|alphabet|apple|meta|microsoft|amazon|nvidia|openai|tesla|binance|coinbase)\b"
+)
 # speed research 2026-10-27: headline-grade company / AI / legal / regulatory events. These hit FJ first but were dropped
 # (Anthropic S-1, MSFT 60k buyouts, GPT-6.1, Comey charged, Ripple OCC approval). Matched on the full line; floor at FJ_MIN_SCORE.
 FJ_HEADLINE = re.compile(
@@ -321,7 +355,7 @@ FJ_HEADLINE = re.compile(
     r"\b(releases?|launch(es)?|unveils?|rolls? out)\b.{0,20}\b(gpt|claude|gemini|grok|llama)[- ]?\d+(\.\d+)?\b|"
     r"\b(charges?|charged|indicts?|indicted|arrests?|arrested)\b.{0,30}\b(former|ex-?)\s?(fbi director|cia director|president|prime minister|attorney general|national security adviser|secretary of \w+)\b|"
     r"\b(former|ex-?)\s?(fbi director|cia director|president|prime minister)\b.{0,40}\b(charged|indicted|arrested|convicted|sentenced)\b|"
-    r"\b(final|full) (us |federal |regulatory |occ |sec )*approval\b|\bnational trust bank\b.{0,30}\b(approv\w+|charter)\b|\bapproves? (the )?(first )?spot\b.{0,20}\betfs?\b", re.I)
+    r"\b(final|full) (us |federal |regulatory |occ |sec )*approval\b|\bnational trust bank\b.{0,30}\b(approv\w+|charter)\b|\bapproves? (the )?(first )?spot\b.{0,20}\betfs?\b|" + _FLOOR_1030, re.I)
 # top-tier FJ_MAJOR events (central-bank decisions, war on a capital/nuclear site, declared war/invasion/coup): floor at FJ_MIN_SCORE
 FJ_TOP = re.compile(
     r"\b(fed|fomc|federal reserve|ecb|boe|boj|bank of (england|japan))\b.{0,40}\b(cuts?|raises?|hikes?|holds?|leaves|keeps|unexpectedly)\b.{0,30}\b(rates?|basis points|bps|bp)\b|"
@@ -849,7 +883,7 @@ OFFICIAL_RELEVANT = {
 OFFICIAL_MAJOR = {
     "Federal Reserve": (re.compile(r"fomc statement|issues fomc|discount rate|emergency|federal funds|monetary policy (statement|action)", re.I), 13),
     "Federal Reserve monetary": (re.compile(r"fomc statement|issues fomc|discount rate|emergency|federal funds|monetary policy (statement|action)", re.I), 13),
-    "ECB press": (re.compile(r"monetary policy decisions?|emergency", re.I), 13),
+    "ECB press": (re.compile(r"monetary policy decisions?|emergency|president .{0,40}(step down|resign|appoint)|appoint\w* .{0,30}president", re.I), 13),
     "Bank of England news": (re.compile(r"bank rate|monetary policy summary|emergency", re.I), 13),
     "Bank of Japan": (re.compile(r"statement on monetary policy|monetary policy decision|change in (the )?(guideline|policy)", re.I), 13),
     "Bank of Canada press": (re.compile(r"(maintains|holds|lowers|raises|cuts|increases|reduces) (its )?(target for the overnight rate|policy rate)", re.I), 13),
@@ -1594,10 +1628,13 @@ def maybe_escalate(st: dict, dry: bool):
     fast_lane = False
     if urgent and gap >= FAST_LANE_MIN_GAP_S:
         send, fast_lane = urgent[:URGENT_MAX_PER_WEBHOOK], True
-    elif batch_gap >= ESC_MIN_GAP_S and gap >= FAST_LANE_MIN_GAP_S and not reserve_only:
-        # priority hits first, then by score
+    elif batch_gap >= (ESC_RESERVE_BATCH_GAP_S if reserve_only else ESC_MIN_GAP_S) and gap >= FAST_LANE_MIN_GAP_S and \
+            (not reserve_only or (esc["count"] < ESC_MAX_PER_DAY - ESC_HARD_RESERVE_URGENT and
+                                  any(h.get("score", 0) >= ESC_RESERVE_BATCH_MIN_SCORE or h.get("priority") for h in pend))):
+        # priority hits first, then by score (reserve mode: strong hits only)
         send, n_ai = [], 0
-        for h in sorted(pend, key=rank):
+        pool = pend if not reserve_only else [h for h in pend if h.get("score", 0) >= ESC_RESERVE_BATCH_MIN_SCORE or h.get("priority")]
+        for h in sorted(pool, key=rank):
             if h.get("topic") == "AI":
                 if n_ai >= AI_MAX_HITS_PER_POST:
                     continue
@@ -1714,7 +1751,8 @@ HEADLINE_FLOOR = re.compile(
     r"|\b(putin|xi jinping|trump|modi|erdogan|macron|zelensky[iy]?|netanyahu|milei)\b.{0,30}\b(says|calls|praises|slams|attacks)\b.{0,40}"
     r"\b(musk|bezos|zuckerberg|altman|jensen huang|saylor|buffett|bill gates)\b"
     r"|\b(billionaires?|founder|creator)\b.{0,60}\b(flees|leaves|quits|exits|moves out of)\b.{0,20}\b(california|new york|the uk|britain|france|norway)\b"
-    r"|\b(oppos\w*|object\w*|reject\w*)\b.{0,60}\btokeni[sz]\w*|\btokeni[sz]\w*\b.{0,40}\b(oppos\w*|objections?)\b",
+    r"|\b(oppos\w*|object\w*|reject\w*)\b.{0,60}\btokeni[sz]\w*|\btokeni[sz]\w*\b.{0,40}\b(oppos\w*|objections?)\b"
+    r"|" + _FLOOR_1030,
     re.I)
 
 
