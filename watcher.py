@@ -1498,7 +1498,7 @@ HB_REPO = os.environ.get("HERALD_HB_REPO", "IamJhmpologoma/herald-watcher")
 HB_EVERY_S = 90
 HB_STALE_S = 300
 _WEBHOOK_LAST = {"ok": 0.0, "fail": 0.0}
-_HB_CACHE = {"t": 0.0, "alive": False, "why": ""}
+_HB_CACHE = {"t": 0.0, "alive": False, "why": "", "failing": []}
 
 
 def _hb_payload(st: dict) -> dict:
@@ -1508,6 +1508,9 @@ def _hb_payload(st: dict) -> dict:
     return {"instance": INSTANCE, "t": round(t), "eat": eat(t), "last_cycle_t": round(lc.get("t", 0)),
             "feeds_ok": ok, "feeds": len(st.get("feed_health", {})),
             "escalations_today": st.get("escalations", {}).get("count", 0),
+            # speed research 2026-10-31: feeds the box can't reach (TLS-blocked Yonhap / ECB press) so the
+            # GHA copy escalates hits from them even while on standby
+            "failing_feeds": sorted(k for k, v in st.get("feed_health", {}).items() if not v.get("ok"))[:40],
             "webhook_last_ok": round(_WEBHOOK_LAST["ok"]), "webhook_last_fail": round(_WEBHOOK_LAST["fail"])}
 
 
@@ -1580,9 +1583,11 @@ def box_alive() -> tuple[bool, str]:
         bad_hook = hb.get("webhook_last_fail", 0) > hb.get("webhook_last_ok", 0) and t - hb.get("webhook_last_fail", 0) < 900
         alive = age < HB_STALE_S and cyc < HB_STALE_S + 120 and not bad_hook
         why = f"heartbeat {round(age)}s old, box cycle {round(cyc)}s ago" + (", box webhook failing" if bad_hook else "")
+        failing = [str(x) for x in (hb.get("failing_feeds") or [])]
     except Exception as e:
         why = f"heartbeat unreadable ({str(e)[:80]})"
-    _HB_CACHE.update(t=t, alive=alive, why=why)
+        failing = []
+    _HB_CACHE.update(t=t, alive=alive, why=why, failing=failing)
     return alive, why
 
 
@@ -1607,16 +1612,24 @@ def maybe_escalate(st: dict, dry: bool):
     if INSTANCE != "box" and not dry:
         alive, why = box_alive()
         st.setdefault("_standby", {})
+        blind = set(_HB_CACHE.get("failing") or [])
         if alive:
+            mine = [h for h in pend if h.get("source") in blind]     # box can't see these feeds: we cover them
             if not st["_standby"].get("on"):
                 log.info("standby: box watcher alive (%s); not escalating", why)
-            st["_standby"] = {"on": True, "dropped": st["_standby"].get("dropped", 0) + len(pend)}
-            log.info("standby: dropped %d hit(s) the box copy will handle", len(pend))
-            st["pending_escalation"] = []
-            return
-        if st["_standby"].get("on"):
-            log.info("TAKEOVER: %s; escalating from this copy", why)
-        st["_standby"] = {"on": False, "dropped": st["_standby"].get("dropped", 0)}
+            st["_standby"] = {"on": True, "dropped": st["_standby"].get("dropped", 0) + len(pend) - len(mine)}
+            if len(pend) - len(mine):
+                log.info("standby: dropped %d hit(s) the box copy will handle", len(pend) - len(mine))
+            if not mine:
+                st["pending_escalation"] = []
+                return
+            log.info("standby: escalating %d hit(s) from feeds the box can't reach: %s", len(mine),
+                     ", ".join(sorted({h.get("source", "?") for h in mine})))
+            pend[:] = mine
+        else:
+            if st["_standby"].get("on"):
+                log.info("TAKEOVER: %s; escalating from this copy", why)
+            st["_standby"] = {"on": False, "dropped": st["_standby"].get("dropped", 0)}
     cfg = load_webhook_cfg()
     if not cfg.get("HERALD_WEBHOOK_URL"):
         if not st.get("_warned_no_webhook_day") == dt.date.today().isoformat():
@@ -1734,6 +1747,18 @@ def is_fast_lane(name: str, it: dict, score: int) -> bool:
 # "Putin invites Zelensky to Moscow" (5), "Binance files for crypto license in Brazil" (6), "Trump ... ban ... AI" (6).
 # Applied only to items the junk filters did not already drop (score > -20), floor = FAST_LANE_MIN_SCORE.
 _BIG_AI = r"(openai|anthropic|xai|google|alphabet|microsoft|meta|apple|amazon|nvidia|amd|broadcom|tsmc|oracle|softbank|tesla|spacex)"
+# speed research 2026-10-31: replayed Oct 30 misses that scored 4-8 (Apple passes Nvidia as most valuable, WG 23:36,
+# no alert; US stocks lose $1.8T; Japan asks OpenAI/Anthropic for model access). Junk (live/preview/opinion) is still
+# dropped by score_news before the floor applies.
+_FLOOR_1031 = (
+    r"\b" + _BIG_AI + r"\b.{0,60}\b(overtakes?|passes|surpasses|tops|reclaims?|becomes|dethrones?|regains?)\b.{0,60}\bmost valuable (company|firm|public company)"
+    r"|\bmost valuable (company|firm)\b.{0,40}\b(again|title|crown)\b"
+    r"|\$\s?\d+(\.\d+)?\s?(trillion|tn)\b.{0,40}\b(wiped|erased|lost|loses|lose|vanish\w*)\b"
+    r"|\b(wipes?|erases?|loses?|lost|sheds?)\b.{0,30}\$\s?\d+(\.\d+)?\s?(trillion|tn)\b"
+    r"|\b(japan|china|eu|european union|uk|britain|india|us|white house|pentagon|government)\b.{0,30}\b(asks?|orders?|demands?|requests?)\b.{0,30}\b(openai|anthropic|google|xai|meta|nvidia)\b"
+    # China official PMI (NBS, 04:30 EAT last day of month) missed Oct 31: scored 5-6 'gate:no-event'
+    r"|\bchina'?s?\b.{0,40}\b(factory activity|manufacturing|services activity|official pmi|pmi)\b.{0,40}\b(contracts?|shrinks?|expands?|grows?|unexpectedly|fastest|slowest|falls?|drops?|rises?)\b"
+)
 HEADLINE_FLOOR = re.compile(
     r"\b" + _BIG_AI + r"\b.{0,50}\b(plans to buy|to buy|buys|will buy|to acquire|acquires|agrees to buy|in talks to (buy|acquire)|"
     r"signs?|strikes?|inks?)\b.{0,50}(\b" + _BIG_AI + r"\b|\bai chips?\b|\btpus?\b|\bgpus?\b)"
@@ -1763,7 +1788,7 @@ HEADLINE_FLOOR = re.compile(
     r"\b(musk|bezos|zuckerberg|altman|jensen huang|saylor|buffett|bill gates)\b"
     r"|\b(billionaires?|founder|creator)\b.{0,60}\b(flees|leaves|quits|exits|moves out of)\b.{0,20}\b(california|new york|the uk|britain|france|norway)\b"
     r"|\b(oppos\w*|object\w*|reject\w*)\b.{0,60}\btokeni[sz]\w*|\btokeni[sz]\w*\b.{0,40}\b(oppos\w*|objections?)\b"
-    r"|" + _FLOOR_1030,
+    r"|" + _FLOOR_1030 + r"|" + _FLOOR_1031,
     re.I)
 
 
