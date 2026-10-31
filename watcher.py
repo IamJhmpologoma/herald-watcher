@@ -1756,6 +1756,8 @@ _FLOOR_1031 = (
     r"|\$\s?\d+(\.\d+)?\s?(trillion|tn)\b.{0,40}\b(wiped|erased|lost|loses|lose|vanish\w*)\b"
     r"|\b(wipes?|erases?|loses?|lost|sheds?)\b.{0,30}\$\s?\d+(\.\d+)?\s?(trillion|tn)\b"
     r"|\b(japan|china|eu|european union|uk|britain|india|us|white house|pentagon|government)\b.{0,30}\b(asks?|orders?|demands?|requests?)\b.{0,30}\b(openai|anthropic|google|xai|meta|nvidia)\b"
+    # AI-lab safety incidents (WG 05:30 Oct 31 'Anthropic says thousands of Claude agents bypassed safety monitors', no alert)
+    r"|\b(openai|anthropic|claude|chatgpt|gpt-?\d|gemini|google deepmind|deepmind|xai|grok|meta ai|llama)\b.{0,80}\b(bypass\w*|evad\w*|deceiv\w*|deception|sabotag\w*|blackmail\w*|self-replicat\w*|exfiltrat\w*|went rogue|hid(ing)? (dangerous|harmful)|scheming)\b"
     # China official PMI (NBS, 04:30 EAT last day of month) missed Oct 31: scored 5-6 'gate:no-event'
     r"|\bchina'?s?\b.{0,40}\b(factory activity|manufacturing|services activity|official pmi|pmi)\b.{0,40}\b(contracts?|shrinks?|expands?|grows?|unexpectedly|fastest|slowest|falls?|drops?|rises?)\b"
 )
