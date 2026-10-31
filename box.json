@@ -1,0 +1,16 @@
+{
+ "instance": "box",
+ "t": 1793438285,
+ "eat": "2026-10-31 12:18:05 EAT",
+ "last_cycle_t": 1793438277,
+ "feeds_ok": 97,
+ "feeds": 100,
+ "escalations_today": 39,
+ "failing_feeds": [
+  "ECB press",
+  "Google DeepMind blog",
+  "Yonhap"
+ ],
+ "webhook_last_ok": 1793438065,
+ "webhook_last_fail": 0
+}
