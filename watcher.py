@@ -1761,6 +1761,14 @@ _FLOOR_1031 = (
     # China official PMI (NBS, 04:30 EAT last day of month) missed Oct 31: scored 5-6 'gate:no-event'
     r"|\bchina'?s?\b.{0,40}\b(factory activity|manufacturing|services activity|official pmi|pmi)\b.{0,40}\b(contracts?|shrinks?|expands?|grows?|unexpectedly|fastest|slowest|falls?|drops?|rises?)\b"
 )
+# speed research 2026-11-04: legislature control calls (CNN/NBC/BBC/Reuters "Democrats win control of US House", 06:06-06:32 EAT)
+# scored 1-8 ('gate:no-entity': parties/chambers aren't entities) while the "poised to win" forecast scored 10. Never alerted.
+_FLOOR_1104 = (
+    r"\b(democrats?|republicans?|gop|labou?r|conservatives?|tories|liberals?|cdu|spd|ldp|bjp|congress party|opposition|ruling (party|coalition))\b"
+    r".{0,40}\b(wins?|won|takes?|took|seiz\w*|keeps?|kept|retains?|holds?|flips?|captures?|clinch\w*|loses?|lost)\b.{0,30}"
+    r"\b(control of|majority (in|of)|the|a|an|outright|absolute|majority)\b.{0,40}\b(house|senate|congress|parliament|bundestag|diet|lok sabha|assembly|legislature|chamber)\b(?!\s+(hearings?|committee|panel|bill|speaker|seats?|races?)\b)"
+    r"|\b(house|senate|congress|parliament)\b.{0,30}\b(control|majority)\b.{0,40}\b(projects?|projected|called|calls|declared)\b"
+)
 HEADLINE_FLOOR = re.compile(
     r"\b" + _BIG_AI + r"\b.{0,50}\b(plans to buy|to buy|buys|will buy|to acquire|acquires|agrees to buy|in talks to (buy|acquire)|"
     r"signs?|strikes?|inks?)\b.{0,50}(\b" + _BIG_AI + r"\b|\bai chips?\b|\btpus?\b|\bgpus?\b)"
@@ -1790,7 +1798,7 @@ HEADLINE_FLOOR = re.compile(
     r"\b(musk|bezos|zuckerberg|altman|jensen huang|saylor|buffett|bill gates)\b"
     r"|\b(billionaires?|founder|creator)\b.{0,60}\b(flees|leaves|quits|exits|moves out of)\b.{0,20}\b(california|new york|the uk|britain|france|norway)\b"
     r"|\b(oppos\w*|object\w*|reject\w*)\b.{0,60}\btokeni[sz]\w*|\btokeni[sz]\w*\b.{0,40}\b(oppos\w*|objections?)\b"
-    r"|" + _FLOOR_1030 + r"|" + _FLOOR_1031,
+    r"|" + _FLOOR_1030 + r"|" + _FLOOR_1031 + r"|" + _FLOOR_1104,
     re.I)
 
 
