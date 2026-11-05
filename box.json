@@ -1,0 +1,15 @@
+{
+ "instance": "box",
+ "t": 1793868767,
+ "eat": "2026-11-05 11:52:46 EAT",
+ "last_cycle_t": 1793868764,
+ "feeds_ok": 98,
+ "feeds": 100,
+ "escalations_today": 74,
+ "failing_feeds": [
+  "ECB press",
+  "Yonhap"
+ ],
+ "webhook_last_ok": 1793867801,
+ "webhook_last_fail": 0
+}
