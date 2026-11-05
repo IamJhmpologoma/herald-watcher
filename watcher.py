@@ -1769,6 +1769,21 @@ _FLOOR_1104 = (
     r"\b(control of|majority (in|of)|the|a|an|outright|absolute|majority)\b.{0,40}\b(house|senate|congress|parliament|bundestag|diet|lok sabha|assembly|legislature|chamber)\b(?!\s+(hearings?|committee|panel|bill|speaker|seats?|races?)\b)"
     r"|\b(house|senate|congress|parliament)\b.{0,30}\b(control|majority)\b.{0,40}\b(projects?|projected|called|calls|declared)\b"
 )
+# speed research 2026-11-05: replayed overnight misses that scored 1-4 (Joshua Wong jailed 10 years, Reuters 06:20 EAT /
+# BBC 06:33, never alerted: 'gate:no-event'; Dem lawmaker wants a superintelligence ban, WG 02:33, 9.7k likes; "$1.2 trillion
+# added to US stocks", WG 00:05, 10.3k likes, scored 4; China indicts ex-Politburo member, Reuters 05:30, scored 3).
+_NOTABLE = (r"(activist|dissident|opposition leader|pro-democracy|journalist|tycoon|billionaire|founder|former (president|prime minister|pm|leader)|"
+            r"ex-(president|prime minister|pm|leader)|(former|ex-) ?politburo|general)")
+_FLOOR_1105 = (
+    r"\b" + _NOTABLE + r"\b.{0,60}\b(sentenc\w*|jailed|imprisoned|gets|given)\b.{0,40}\b\d{1,3}(\s|-)(years?|yrs)\b"
+    r"|\b(sentenc\w*|jails?|jailed|imprisons?)\b.{0,30}\b" + _NOTABLE + r"\b.{0,60}\b\d{1,3}(\s|-)(years?|yrs)\b"
+    r"|\b(sentenc\w*|jailed)\b.{0,30}\b\d{1,3} years\b.{0,80}\bnational security\b"
+    r"|\b(indicts?|indicted|charges?|charged|arrests?|arrested|detains?|detained|expels?|expelled)\b.{0,30}\b(ex-|former )(politburo|president|prime minister|pm|defen[cs]e minister|central bank (chief|governor))"
+    r"|\b(bans?|banning|outlaw\w*|moratorium|prohibit\w*|pause)\b.{0,40}\b(artificial )?(superintelligen\w*|agi\b|artificial general intelligence|frontier ai)"
+    r"|\bsuperintelligen\w*\b.{0,40}\b(bans?|banned|bill|outlaw\w*|moratorium)\b"
+    r"|\b(adds?|added|gains?|gained|grows?|soars?|jumps?|surges?)\b.{0,30}\$\s?\d+(\.\d+)?\s?(trillion|tn)\b"
+    r"|\$\s?\d+(\.\d+)?\s?(trillion|tn)\b.{0,30}\b(added|gained|in (market )?value)\b"
+)
 HEADLINE_FLOOR = re.compile(
     r"\b" + _BIG_AI + r"\b.{0,50}\b(plans to buy|to buy|buys|will buy|to acquire|acquires|agrees to buy|in talks to (buy|acquire)|"
     r"signs?|strikes?|inks?)\b.{0,50}(\b" + _BIG_AI + r"\b|\bai chips?\b|\btpus?\b|\bgpus?\b)"
@@ -1798,7 +1813,7 @@ HEADLINE_FLOOR = re.compile(
     r"\b(musk|bezos|zuckerberg|altman|jensen huang|saylor|buffett|bill gates)\b"
     r"|\b(billionaires?|founder|creator)\b.{0,60}\b(flees|leaves|quits|exits|moves out of)\b.{0,20}\b(california|new york|the uk|britain|france|norway)\b"
     r"|\b(oppos\w*|object\w*|reject\w*)\b.{0,60}\btokeni[sz]\w*|\btokeni[sz]\w*\b.{0,40}\b(oppos\w*|objections?)\b"
-    r"|" + _FLOOR_1030 + r"|" + _FLOOR_1031 + r"|" + _FLOOR_1104,
+    r"|" + _FLOOR_1030 + r"|" + _FLOOR_1031 + r"|" + _FLOOR_1104 + r"|" + _FLOOR_1105,
     re.I)
 
 
