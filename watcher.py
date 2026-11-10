@@ -296,6 +296,9 @@ FJ_DATA_MAJOR = [
     (re.compile(r"^(us )?(core )?cpi (yoy|y/y|mom|m/m)", re.I), 0.2),
     (re.compile(r"^(us )?unemployment rate", re.I), 0.2),
     (re.compile(r"^(us )?(gdp|gdp growth rate).{0,20}(qoq|annuali[sz]ed|advance)", re.I), 1.0),
+    # speed research 2026-11-10: China's monthly trade print is WG-tier (WG 05:35 EAT Nov 10 "trade surplus falls to
+    # $105.28B, below expectations"); we waited for Reuters via Google News and posted 05:51 (+16 min).
+    (re.compile(r"^china.{0,10}(trade balance|exports? (yoy|y/y))", re.I), 0.0),
 ]
 # headline-worthy signal required for every non-data FJ item
 FJ_MAJOR = re.compile(
