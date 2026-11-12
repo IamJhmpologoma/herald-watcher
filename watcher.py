@@ -95,7 +95,7 @@ FAST_LANE_PUBLISHERS = re.compile(r"^(reuters|associated press|ap news|bloomberg
                                   r"cnbc|the wall street journal|wsj|financial times|"
                                   r"the white house|federal reserve|u\.s\. department of the treasury|bureau of labor statistics)\b", re.I)
 FAST_LANE_FEEDS = re.compile(r"^(Reuters|BBC|Nikkei|CNBC|WSJ|MarketWatch Bulletins|Federal Reserve|SEC press|White House|ECB|Bank of (England|Japan|Canada)|BEA|"
-                             r"Yonhap|AP Bluesky|GN: (Reuters|AP|Bloomberg|treasury\.gov|bls\.gov))", re.I)   # Yonhap added 2026-10-30 (NK missiles)
+                             r"Yonhap|AP Bluesky|NYT (Technology|Home)|GN: (Reuters|AP|Bloomberg|treasury\.gov|bls\.gov))", re.I)   # Yonhap added 2026-10-30 (NK missiles)
 AI_STORY_DEDUPE_S = 12 * 3600
 
 def gnews(q: str) -> str:
@@ -123,6 +123,13 @@ NEWS_FEEDS = [
     ("Guardian Business", "https://www.theguardian.com/business/rss", "reputable", 120),
     ("NYT World", "https://rss.nytimes.com/services/xml/rss/nyt/World.xml", "reputable", 90),
     ("NYT Business", "https://rss.nytimes.com/services/xml/rss/nyt/Business.xml", "reputable", 120),
+    # speed research 2026-11-12: the Nvidia/Huang scoops broke in WSJ Tech/US Business and NYT Technology, none of which we
+    # polled (WSJ "Nvidia Is Preparing to Oust CEO Jensen Huang": WG 01:31 EAT, our first hit Fortune via GN 02:16 -> posted 02:19;
+    # NYT "Huang ... Relationship With Nvidia Executive": WG 01:01, 11.4k likes, our first hit Yahoo 01:57). Public Dow Jones / NYT RSS, curl-checked.
+    ("WSJ Tech", "https://feeds.content.dowjones.io/public/rss/RSSWSJD", "reputable", 45),
+    ("WSJ US Business", "https://feeds.content.dowjones.io/public/rss/WSJcomUSBusiness", "reputable", 45),
+    ("NYT Technology", "https://rss.nytimes.com/services/xml/rss/nyt/Technology.xml", "reputable", 60),
+    ("NYT Home", "https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml", "reputable", 60),
     # official
     # press_all.xml is the right URL (200 + ETag); its CDN returns a stray 404 now and then -> fetch retries once.
     ("Federal Reserve", "https://www.federalreserve.gov/feeds/press_all.xml", "official", 30),
@@ -191,7 +198,7 @@ NEWS_FEEDS = [
     ("GN: crypto licences", gnews('(Binance OR Coinbase OR Kraken OR Ripple OR Tether OR Circle OR OKX OR Bybit OR Robinhood) (license OR licence OR charter OR "partnership") when:2h'), "aggregator", 180),
 ]
 # feeds added in the latency pass: their first fetch only marks items seen (no backlog burst)
-LATENCY_NEW_FEEDS = {"GN: big tech x crypto", "GN: crypto law/courts", "GN: IMF deals", "GN: The Information", "GN: leader talks", "GN: crypto licences", "Federal Reserve monetary", "White House actions", "ECB press", "Bank of England news", "Bank of Japan",
+LATENCY_NEW_FEEDS = {"WSJ Tech", "WSJ US Business", "NYT Technology", "NYT Home", "GN: big tech x crypto", "GN: crypto law/courts", "GN: IMF deals", "GN: The Information", "GN: leader talks", "GN: crypto licences", "Federal Reserve monetary", "White House actions", "ECB press", "Bank of England news", "Bank of Japan",
                      "Bank of Canada press", "BEA releases", "GN: central banks", "GN: megacap deals",
                      "GN: Reuters business", "GN: Reuters markets",
                      "GN: megacap newsrooms", "GN: megacap press wires", "Yonhap", "AP Bluesky"}
@@ -844,7 +851,7 @@ NEWS_BIG = re.compile(
     r"\b(magnitude|m)\s?[6-9](\.\d)?\b.{0,30}\bearthquake\b|\bearthquake\b.{0,40}\b[6-9]\.\d\b|\btsunami (warning|alert|hits)\b|"
     r"\binvasion of\b|\binvades?\b", re.I)
 NEWS_FLUFF = re.compile(
-    r"\bopinion\b|op-ed|\banalysis\b|\bcommentary\b|\bcolumn\b|\bexplainer\b|\bexplained\b|what to know|"
+    r"\bopinion\b|op-ed|\banalysis\b|^(a )?timeline\b|\ba timeline of\b|\bcommentary\b|\bcolumn\b|\bexplainer\b|\bexplained\b|what to know|"
     r"what we know|\btakeaways?\b|\bkey moments\b|\bwhat happened\b|\bhow to\b|\bhow (the|a|an|this|it)\b|^why\b|\bwhy (the|a|an|this|you|it|investors|stocks)\b|"
     r"^live news\b|^the (morning|evening|daily|weekly) \w+( \w+)? (report|brief|briefing|download|wrap)\b|"  # latency pass: live blogs/newsletters never urgent
     r"\bpodcast\b|\bnewsletter\b|^watch:|^video:|^live:|\blive updates?\b|\blive:|\bas it happened\b|week ahead|"
@@ -1787,6 +1794,18 @@ _FLOOR_1105 = (
     r"|\b(adds?|added|gains?|gained|grows?|soars?|jumps?|surges?)\b.{0,30}\$\s?\d+(\.\d+)?\s?(trillion|tn)\b"
     r"|\$\s?\d+(\.\d+)?\s?(trillion|tn)\b.{0,30}\b(added|gained|in (market )?value)\b"
 )
+# speed research 2026-11-12: replayed overnight Nvidia/Huang misses that scored 5-7 'gate:no-event' (WSJ "Nvidia Is Preparing
+# to Oust CEO Jensen Huang", WG 01:31 33k likes; NYT "Board Is Meeting to Discuss Jensen Huang's Future", WG 02:50; NYT "Huang Said
+# to Have Had Relationship With Nvidia Executive", WG 01:01 11.4k; MSCI removing Strategy, WG 01:06; Musk "honor to hire" Huang, WG 04:25).
+_CEO = r"(ceo|chief executive|chairman|founder|jensen huang|huang|musk|altman|zuckerberg|nadella|pichai|cook|bezos|jassy|saylor)"
+_FLOOR_1112 = (
+    r"\b" + _BIG_AI + r"\b.{0,60}\b(oust\w*|fires?|firing|to fire|fired|replac\w*|remov\w*|push(es|ing)? out|sacks?|sacked)\b.{0,30}\b" + _CEO + r"\b"
+    r"|\b" + _BIG_AI + r"\b.{0,40}\bboard\b.{0,40}\b(meet\w*|weighs?|consider\w*|discuss\w*|votes?|decides?)\b.{0,50}\b" + _CEO + r"\b"
+    r"|\b" + _CEO + r"\b.{0,60}\b(affair|relationship with|romantic relationship)\b"
+    r"|\b(msci|ftse russell|s&p dow jones|s&p 500|nasdaq-100)\b.{0,40}\b(remov\w*|drop\w*|exclud\w*|delet\w*|kick\w*|add\w*|includ\w*)\b.{0,40}\b(strategy|microstrategy|mstr|bitcoin treasury|crypto treasury)\b"
+    r"|\b(strategy|microstrategy|mstr)\b.{0,40}\b(removed|dropped|excluded|kicked out|added)\b.{0,30}\b(msci|index|indexes|indices|s&p)\b"
+    r"|\b(musk|bezos|zuckerberg|altman|trump)\b.{0,40}\b(hire|hiring|offers? (a )?job)\b.{0,30}\b(jensen huang|huang|ousted ceo)\b"
+)
 HEADLINE_FLOOR = re.compile(
     r"\b" + _BIG_AI + r"\b.{0,50}\b(plans to buy|to buy|buys|will buy|to acquire|acquires|agrees to buy|in talks to (buy|acquire)|"
     r"signs?|strikes?|inks?)\b.{0,50}(\b" + _BIG_AI + r"\b|\bai chips?\b|\btpus?\b|\bgpus?\b)"
@@ -1816,7 +1835,7 @@ HEADLINE_FLOOR = re.compile(
     r"\b(musk|bezos|zuckerberg|altman|jensen huang|saylor|buffett|bill gates)\b"
     r"|\b(billionaires?|founder|creator)\b.{0,60}\b(flees|leaves|quits|exits|moves out of)\b.{0,20}\b(california|new york|the uk|britain|france|norway)\b"
     r"|\b(oppos\w*|object\w*|reject\w*)\b.{0,60}\btokeni[sz]\w*|\btokeni[sz]\w*\b.{0,40}\b(oppos\w*|objections?)\b"
-    r"|" + _FLOOR_1030 + r"|" + _FLOOR_1031 + r"|" + _FLOOR_1104 + r"|" + _FLOOR_1105,
+    r"|" + _FLOOR_1030 + r"|" + _FLOOR_1031 + r"|" + _FLOOR_1104 + r"|" + _FLOOR_1105 + r"|" + _FLOOR_1112,
     re.I)
 
 
