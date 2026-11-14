@@ -1,0 +1,12 @@
+{
+ "instance": "box",
+ "t": 1794655742,
+ "eat": "2026-11-14 14:29:02 EAT",
+ "last_cycle_t": 1794655737,
+ "feeds_ok": 104,
+ "feeds": 104,
+ "escalations_today": 0,
+ "failing_feeds": [],
+ "webhook_last_ok": 1794491926,
+ "webhook_last_fail": 1794655622
+}
